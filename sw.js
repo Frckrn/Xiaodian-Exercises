@@ -2,7 +2,7 @@
  * Bump CACHE_VERSION whenever the app shell changes so installed clients
  * receive the new HTML, CSS, JavaScript and icons.
  */
-const CACHE_VERSION = "v1";
+const CACHE_VERSION = "v3";
 const CACHE_NAME = `xiaodian-shell-${CACHE_VERSION}`;
 const APP_SCOPE = new URL("./", self.location.href).href;
 const INDEX_URL = new URL("index.html", APP_SCOPE).href;

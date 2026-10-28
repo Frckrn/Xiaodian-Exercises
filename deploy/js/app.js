@@ -4,6 +4,21 @@
   const STORAGE_KEYS = {
     bank: "xiaodian.bank.v1",
     records: "xiaodian.records.v1",
+    wrongbook: "xiaodian.wrongbook.v1",
+    prefs: "xiaodian.prefs.v1",
+  };
+
+  /* 进行中的会话放在 sessionStorage：关闭标签页即失效，但刷新/被系统回收后可恢复。 */
+  const SESSION_STORAGE_KEY = "xiaodian.session.v1";
+  const SESSION_VERSION = 2;
+  const SESSION_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
+  const BACKUP_APP = "xiaodian";
+  const BACKUP_VERSION = 1;
+
+  const WRONGBOOK_FILTERS = {
+    all: { label: "全部" },
+    pending: { label: "待攻克" },
+    mastered: { label: "已掌握" },
   };
 
   const TYPE_META = {
@@ -229,19 +244,28 @@
     list: '<path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/>',
     lock: '<rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
     eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+    trash: '<path d="M3 6h18"/><path d="M9 6V3.5h6V6"/><path d="M6 6l1 14h10l1-14"/><path d="M10 11v5"/><path d="M14 11v5"/>',
+    archive: '<rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/>',
   };
 
   const state = {
     bank: null,
     records: [],
+    wrongbook: [],
+    prefs: {},
     route: "home",
     modal: null,
     session: null,
     result: null,
+    snapshot: null,
+    wrongFilter: "all",
+    bankStats: null,
     storageOk: true,
   };
 
   let examClockTimer = null;
+  let sessionSaveTimer = null;
+  let wrongbookSaveTimer = null;
   let lastFocusedElement = null;
 
   const app = document.getElementById("app");
@@ -282,6 +306,429 @@
       toast("浏览器未能保存数据，导入的题库可能在刷新后丢失。", "warning");
       return false;
     }
+  }
+
+  /* ----------------------------------------------------------------------- */
+  /* Transient storage (sessionStorage)                                      */
+  /* ----------------------------------------------------------------------- */
+
+  function readTransient(key) {
+    try {
+      const raw = window.sessionStorage.getItem(key);
+      return raw ? JSON.parse(raw) : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function writeTransient(key, value) {
+    try {
+      window.sessionStorage.setItem(key, JSON.stringify(value));
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function removeTransient(key) {
+    try {
+      window.sessionStorage.removeItem(key);
+    } catch (error) {
+      /* 隐私模式下 sessionStorage 可能不可用，忽略即可。 */
+    }
+  }
+
+  /* ----------------------------------------------------------------------- */
+  /* Wrong book                                                              */
+  /* ----------------------------------------------------------------------- */
+
+  /**
+   * 生成稳定的题目指纹：题型 + 题干 + 选项文本。
+   * 不使用每次导入都会变化的 id，保证重新导入题库后错题记录仍能对上。
+   */
+  function questionKey(question) {
+    if (!question) return "";
+    const stem = String(question.stem || "").replace(/[\s\u3000]+/g, "");
+    const options = (Array.isArray(question.options) ? question.options : [])
+      .map(
+        (option) =>
+          `${String((option && option.key) || "")}.${String((option && option.text) || "").replace(/[\s\u3000]+/g, "")}`
+      )
+      .join("|");
+    return `${String(question.type || "")}#${stem}#${options}`;
+  }
+
+  /** 保存错题所需的题目快照，避免题库被替换后错题内容丢失。 */
+  function snapshotQuestion(question) {
+    return {
+      type: question.type,
+      stem: question.stem,
+      options: (question.options || []).map((option) => ({ key: option.key, text: option.text })),
+      answer: [...(question.answer || [])],
+      analysis: question.analysis || "",
+      category: question.category || "未分类",
+      difficulty: question.difficulty || "",
+      score: Number(question.score) || 0,
+    };
+  }
+
+  function normalizeWrongbook(value) {
+    if (!Array.isArray(value)) return [];
+    const entries = [];
+    const seen = new Set();
+    value.forEach((entry) => {
+      if (!entry || typeof entry !== "object") return;
+      const question = entry.question;
+      if (!isQuestionShape(question)) return;
+      const key = typeof entry.key === "string" && entry.key ? entry.key : questionKey(question);
+      if (seen.has(key)) return;
+      seen.add(key);
+      const rightStreak = Math.max(0, Math.round(Number(entry.rightStreak) || 0));
+      entries.push({
+        key,
+        question: snapshotQuestion(question),
+        wrongCount: Math.max(1, Math.round(Number(entry.wrongCount) || 1)),
+        rightStreak,
+        lastWrongAt: Number(entry.lastWrongAt) || 0,
+        lastSeenAt: Number(entry.lastSeenAt) || Number(entry.lastWrongAt) || 0,
+        mastered: Boolean(entry.mastered) || rightStreak >= 2,
+      });
+    });
+    return entries;
+  }
+
+  function normalizePrefs(value) {
+    const source = value && typeof value === "object" ? value : {};
+    const minutes = Number(source.examMinutes);
+    return {
+      setupOrder: source.setupOrder === "random" ? "random" : "sequential",
+      examMinutes: Number.isFinite(minutes) && minutes >= 1 && minutes <= 300 ? Math.round(minutes) : 30,
+    };
+  }
+
+  function loadWrongbook() {
+    return normalizeWrongbook(readStorage(STORAGE_KEYS.wrongbook));
+  }
+
+  function saveWrongbook(immediate) {
+    if (immediate) {
+      if (wrongbookSaveTimer) {
+        window.clearTimeout(wrongbookSaveTimer);
+        wrongbookSaveTimer = null;
+      }
+      return writeStorage(STORAGE_KEYS.wrongbook, state.wrongbook);
+    }
+    /* 一次练习可能连续提交上百题，合并写入避免频繁序列化整个错题本。 */
+    if (wrongbookSaveTimer) return true;
+    wrongbookSaveTimer = window.setTimeout(() => {
+      wrongbookSaveTimer = null;
+      writeStorage(STORAGE_KEYS.wrongbook, state.wrongbook);
+    }, 250);
+    return true;
+  }
+
+  function savePrefs() {
+    writeStorage(STORAGE_KEYS.prefs, state.prefs);
+  }
+
+  /** 立即写入尚未落盘的错题本变更（页面隐藏/卸载时使用）。 */
+  function flushWrongbook() {
+    if (!wrongbookSaveTimer) return;
+    window.clearTimeout(wrongbookSaveTimer);
+    wrongbookSaveTimer = null;
+    writeStorage(STORAGE_KEYS.wrongbook, state.wrongbook);
+  }
+
+  function wrongbookStats() {
+    const entries = state.wrongbook;
+    const pending = entries.filter((entry) => !entry.mastered).length;
+    const totalWrong = entries.reduce((sum, entry) => sum + (Number(entry.wrongCount) || 0), 0);
+    return { total: entries.length, pending, mastered: entries.length - pending, totalWrong };
+  }
+
+  /** 错题本排序：错得多的优先，其次按最近答错时间。 */
+  function sortedWrongbook() {
+    return [...state.wrongbook].sort(
+      (a, b) =>
+        (Number(b.wrongCount) || 0) - (Number(a.wrongCount) || 0) ||
+        (Number(b.lastWrongAt) || 0) - (Number(a.lastWrongAt) || 0)
+    );
+  }
+
+  function filteredWrongbook() {
+    const entries = sortedWrongbook();
+    if (state.wrongFilter === "pending") return entries.filter((entry) => !entry.mastered);
+    if (state.wrongFilter === "mastered") return entries.filter((entry) => entry.mastered);
+    return entries;
+  }
+
+  function findWrongEntry(question) {
+    const key = questionKey(question);
+    return state.wrongbook.find((entry) => entry.key === key) || null;
+  }
+
+  /**
+   * 记录一次错误。deferSave 用于批量写入（例如考试交卷时一次性保存）。
+   */
+  function recordWrongQuestion(question, deferSave) {
+    if (!question) return;
+    const key = questionKey(question);
+    if (!key) return;
+    const now = Date.now();
+    const snapshot = snapshotQuestion(question);
+    const index = state.wrongbook.findIndex((entry) => entry.key === key);
+    if (index >= 0) {
+      const entry = state.wrongbook[index];
+      state.wrongbook[index] = {
+        ...entry,
+        question: snapshot,
+        wrongCount: (Number(entry.wrongCount) || 0) + 1,
+        rightStreak: 0,
+        mastered: false,
+        lastWrongAt: now,
+        lastSeenAt: now,
+      };
+    } else {
+      state.wrongbook.unshift({
+        key,
+        question: snapshot,
+        wrongCount: 1,
+        rightStreak: 0,
+        lastWrongAt: now,
+        lastSeenAt: now,
+        mastered: false,
+      });
+    }
+    if (!deferSave) saveWrongbook();
+  }
+
+  /** 记录一次答对：连对 2 次即视为掌握。不在错题本中的题忽略。 */
+  function recordCorrectQuestion(question) {
+    if (!question) return;
+    const key = questionKey(question);
+    const index = state.wrongbook.findIndex((entry) => entry.key === key);
+    if (index < 0) return;
+    const entry = state.wrongbook[index];
+    const rightStreak = (Number(entry.rightStreak) || 0) + 1;
+    state.wrongbook[index] = {
+      ...entry,
+      question: snapshotQuestion(question),
+      rightStreak,
+      mastered: rightStreak >= 2,
+      lastSeenAt: Date.now(),
+    };
+    saveWrongbook();
+  }
+
+  /* ----------------------------------------------------------------------- */
+  /* Session snapshot                                                        */
+  /* ----------------------------------------------------------------------- */
+
+  function serializeSession(session) {
+    return {
+      version: SESSION_VERSION,
+      savedAt: Date.now(),
+      mode: session.mode,
+      questions: session.questions,
+      index: session.index,
+      selections: session.selections,
+      evaluations: session.evaluations,
+      flags: session.flags,
+      startedAt: session.startedAt,
+      bankName: session.bankName || "",
+      isReview: Boolean(session.isReview),
+      configLabel: session.configLabel || "",
+      focusCategories: Array.isArray(session.focusCategories) ? session.focusCategories : null,
+      wrongRecorded: Array.isArray(session.wrongRecorded) ? session.wrongRecorded : [],
+      exam: session.exam
+        ? {
+            timed: Boolean(session.exam.timed),
+            minutes: Number(session.exam.minutes) || 0,
+            deadline: Number(session.exam.deadline) || null,
+            autoSubmitted: Boolean(session.exam.autoSubmitted),
+          }
+        : null,
+    };
+  }
+
+  /**
+   * 校验并还原快照。任何结构不符都返回 null，由调用方静默丢弃。
+   */
+  function deserializeSession(snapshot) {
+    try {
+      if (!snapshot || typeof snapshot !== "object") return null;
+      if (Number(snapshot.version) !== SESSION_VERSION) return null;
+      if (!snapshot.savedAt || Date.now() - Number(snapshot.savedAt) > SESSION_MAX_AGE) return null;
+      if (!MODE_META[snapshot.mode]) return null;
+      const rawQuestions = Array.isArray(snapshot.questions) ? snapshot.questions : [];
+      if (!rawQuestions.length || !rawQuestions.every(isQuestionShape)) return null;
+      const questions = rawQuestions;
+      const total = questions.length;
+      const selections = Array.from({ length: total }, (_, index) => {
+        const raw = Array.isArray(snapshot.selections) ? snapshot.selections[index] : null;
+        if (!Array.isArray(raw)) return [];
+        const validKeys = questions[index].options.map((option) => option.key);
+        return raw.filter((key) => validKeys.includes(key)).sort();
+      });
+      const evaluations = Array.from({ length: total }, (_, index) => {
+        const raw = Array.isArray(snapshot.evaluations) ? snapshot.evaluations[index] : null;
+        if (!raw || typeof raw !== "object") return null;
+        return {
+          selected: Array.isArray(raw.selected) ? [...raw.selected] : [],
+          isCorrect: Boolean(raw.isCorrect),
+          missing: Array.isArray(raw.missing) ? [...raw.missing] : undefined,
+          extra: Array.isArray(raw.extra) ? [...raw.extra] : undefined,
+        };
+      });
+      const flags = Array.from({ length: total }, (_, index) =>
+        Boolean(Array.isArray(snapshot.flags) ? snapshot.flags[index] : false)
+      );
+      const index = Math.min(total - 1, Math.max(0, Math.round(Number(snapshot.index) || 0)));
+      let exam = null;
+      if (snapshot.mode === "exam") {
+        const source = snapshot.exam && typeof snapshot.exam === "object" ? snapshot.exam : {};
+        exam = {
+          timed: Boolean(source.timed),
+          minutes: Math.max(0, Math.round(Number(source.minutes) || 0)),
+          deadline: Number(source.deadline) || null,
+          autoSubmitted: Boolean(source.autoSubmitted),
+        };
+        if (!exam.timed) exam.deadline = null;
+        if (exam.timed && !exam.deadline) return null;
+      }
+      return {
+        mode: snapshot.mode,
+        questions,
+        index,
+        selections,
+        evaluations: snapshot.mode === "practice" ? evaluations : evaluations.map(() => null),
+        flags,
+        startedAt: Number(snapshot.startedAt) || Date.now(),
+        finished: false,
+        isReview: Boolean(snapshot.isReview),
+        exam,
+        bankName: String(snapshot.bankName || ""),
+        configLabel: String(snapshot.configLabel || (snapshot.isReview ? "错题重练" : "全部分类")),
+        focusCategories: Array.isArray(snapshot.focusCategories)
+          ? snapshot.focusCategories.filter((item) => typeof item === "string")
+          : null,
+        wrongRecorded: Array.isArray(snapshot.wrongRecorded)
+          ? snapshot.wrongRecorded.map((item) => Number(item)).filter((item) => Number.isFinite(item))
+          : [],
+      };
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function writeSessionSnapshot() {
+    if (!state.session || state.session.finished || state.route !== "session") {
+      removeTransient(SESSION_STORAGE_KEY);
+      return;
+    }
+    writeTransient(SESSION_STORAGE_KEY, serializeSession(state.session));
+  }
+
+  function scheduleSessionSave() {
+    if (sessionSaveTimer) return;
+    sessionSaveTimer = window.setTimeout(() => {
+      sessionSaveTimer = null;
+      writeSessionSnapshot();
+    }, 300);
+  }
+
+  function flushSessionSnapshot() {
+    if (sessionSaveTimer) {
+      window.clearTimeout(sessionSaveTimer);
+      sessionSaveTimer = null;
+    }
+    writeSessionSnapshot();
+  }
+
+  function clearSessionSnapshot() {
+    if (sessionSaveTimer) {
+      window.clearTimeout(sessionSaveTimer);
+      sessionSaveTimer = null;
+    }
+    removeTransient(SESSION_STORAGE_KEY);
+    state.snapshot = null;
+  }
+
+  /**
+   * 读取快照原文（用于首页展示），只有通过 deserializeSession 校验的才返回。
+   */
+  function loadSessionSnapshot() {
+    const raw = readTransient(SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    return deserializeSession(raw) ? raw : null;
+  }
+
+  /* ----------------------------------------------------------------------- */
+  /* Derived helpers                                                         */
+  /* ----------------------------------------------------------------------- */
+
+  function bankStats() {
+    if (state.bankStats && state.bankStats.bankRef === state.bank) return state.bankStats;
+    const questions = state.bank.questions;
+    const stats = {
+      bankRef: state.bank,
+      total: questions.length,
+      counts: countByType(questions),
+      categories: uniqueCategories(questions),
+      totalPoints: totalScore(questions),
+    };
+    state.bankStats = stats;
+    return stats;
+  }
+
+  function dayKey(date) {
+    return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`;
+  }
+
+  /** 连续学习天数：按记录日期去重；今天没练时允许从昨天往前算。 */
+  function studyStreakDays() {
+    const days = new Set();
+    state.records.forEach((record) => {
+      const date = new Date(record.finishedAt);
+      if (!Number.isNaN(date.getTime())) days.add(dayKey(date));
+    });
+    if (!days.size) return 0;
+    const today = new Date();
+    const cursor = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    if (!days.has(dayKey(cursor))) cursor.setDate(cursor.getDate() - 1);
+    let streak = 0;
+    while (days.has(dayKey(cursor))) {
+      streak += 1;
+      cursor.setDate(cursor.getDate() - 1);
+    }
+    return streak;
+  }
+
+  /** 上一次同模式的成绩记录（当前这一轮的记录已在 records 首位）。 */
+  function previousRecord(result) {
+    if (!result || !state.records.length) return null;
+    return (
+      state.records.find(
+        (record) =>
+          record.mode === result.mode && !record.isReview && Number(record.finishedAt) < Number(result.finishedAt)
+      ) || null
+    );
+  }
+
+  /** 按分类统计本轮题数与正确率，按正确率升序返回。 */
+  function categoryBreakdown(result) {
+    const buckets = new Map();
+    (result.questions || []).forEach((entry) => {
+      if (!entry || !entry.question) return;
+      const category = entry.question.category || "未分类";
+      const bucket = buckets.get(category) || { category, total: 0, correct: 0 };
+      bucket.total += 1;
+      if (entry.isCorrect) bucket.correct += 1;
+      buckets.set(category, bucket);
+    });
+    return Array.from(buckets.values())
+      .map((bucket) => ({ ...bucket, accuracy: bucket.total ? Math.round((bucket.correct / bucket.total) * 100) : 0 }))
+      .sort((a, b) => a.accuracy - b.accuracy || b.total - a.total);
   }
 
   function isQuestionShape(question) {
@@ -453,6 +900,9 @@
     const storedBank = normalizeStoredBank(readStorage(STORAGE_KEYS.bank));
     state.bank = storedBank || makeDemoBank();
     state.records = loadRecords();
+    state.wrongbook = loadWrongbook();
+    state.prefs = normalizePrefs(readStorage(STORAGE_KEYS.prefs));
+    state.snapshot = loadSessionSnapshot();
     bindEvents();
     render();
     registerServiceWorker();
@@ -474,10 +924,11 @@
 
   function viewHome() {
     const questions = state.bank.questions;
-    const counts = countByType(questions);
-    const categories = uniqueCategories(questions);
-    const total = questions.length;
-    const totalPoints = totalScore(questions);
+    const stats = bankStats();
+    const counts = stats.counts;
+    const categories = stats.categories;
+    const total = stats.total;
+    const totalPoints = stats.totalPoints;
     const recentRecords = state.records.slice(0, 3);
     const sourceFile = state.bank.sourceFile || "本机题库.xlsx";
     const storageLabel = state.storageOk ? "已保存在本机" : "仅本次有效";
@@ -496,6 +947,7 @@
             <div class="header-actions">
               <span class="save-status ${state.storageOk ? "" : "is-warning"}"><span class="save-dot"></span>${storageLabel}</span>
               <button type="button" class="text-button header-help" data-action="open-help">题库格式</button>
+              <button type="button" class="text-button header-help" data-action="open-backup">数据备份</button>
               <button type="button" class="button button-primary button-small" data-action="open-import">
                 ${icon("upload", 17)}导入题库
               </button>
@@ -564,6 +1016,8 @@
               ${["practice", "memorize", "exam"].map((mode) => modeCard(mode)).join("")}
             </div>
           </section>
+
+          ${homePulseSection()}
 
           <section class="insight-grid">
             <article class="panel overview-panel">
@@ -643,6 +1097,104 @@
           <span>用 Excel，整理你的知识。</span>
         </footer>
       </div>
+    `;
+  }
+
+  /* ----------------------------------------------------------------------- */
+  /* Home · pulse (resume / wrong book / habit)                              */
+  /* ----------------------------------------------------------------------- */
+
+  function resumeCardMarkup(snapshot) {
+    const meta = MODE_META[snapshot.mode] || MODE_META.practice;
+    const total = Array.isArray(snapshot.questions) ? snapshot.questions.length : 0;
+    if (!total) return "";
+    const index = Math.min(total - 1, Math.max(0, Number(snapshot.index) || 0));
+    const isExam = snapshot.mode === "exam";
+    const selections = Array.isArray(snapshot.selections) ? snapshot.selections : [];
+    const answered = isExam
+      ? selections.filter((selection) => Array.isArray(selection) && selection.length).length
+      : index + 1;
+    const progress = total ? Math.round((answered / total) * 100) : 0;
+    let timerText = "";
+    if (isExam && snapshot.exam && snapshot.exam.timed) {
+      const remaining = Math.max(0, (Number(snapshot.exam.deadline) - Date.now()) / 1000);
+      timerText = remaining > 0 ? `剩余 ${formatClock(remaining)}` : "已超时，恢复后将自动交卷";
+    }
+    return `
+      <article class="resume-card">
+        <span class="resume-icon">${icon(isExam ? "timer" : "rotate", 22)}</span>
+        <div class="resume-copy">
+          <p class="eyebrow">RESUME · 继续上次</p>
+          <h3>${escapeHtml(snapshot.isReview ? "错题重练" : meta.label)}还没做完</h3>
+          <p>${isExam ? `已答 ${answered} / ${total} 题` : `进度 ${index + 1} / ${total} 题`}${
+            timerText ? ` · ${timerText}` : ""
+          } · ${formatDate(snapshot.savedAt, true)}保存</p>
+          <div class="resume-track"><span style="width:${progress}%"></span></div>
+        </div>
+        <div class="resume-actions">
+          <button type="button" class="button button-primary" data-action="resume-session">${icon("play", 16)}继续学习</button>
+          <button type="button" class="button button-text" data-action="discard-session">放弃</button>
+        </div>
+      </article>
+    `;
+  }
+
+  function homePulseSection() {
+    const stats = wrongbookStats();
+    const snapshot = state.snapshot;
+    const streak = studyStreakDays();
+    const totalRounds = state.records.length;
+    return `
+      <section class="home-pulse" aria-label="学习状态与数据">
+        ${snapshot ? resumeCardMarkup(snapshot) : ""}
+        <div class="pulse-grid">
+          <article class="pulse-card pulse-card-wrong">
+            <div class="pulse-head">
+              <span class="pulse-icon pulse-icon-wrong">${icon("target", 20)}</span>
+              <div class="pulse-title"><p class="eyebrow">WRONG BOOK</p><h3>错题本</h3></div>
+              <span class="pulse-badge">${stats.pending ? `待攻克 ${stats.pending}` : "暂无待攻克"}</span>
+            </div>
+            <div class="pulse-stats">
+              <div><strong>${stats.pending}</strong><span>待攻克</span></div>
+              <div><strong>${stats.mastered}</strong><span>已掌握</span></div>
+              <div><strong>${stats.totalWrong}</strong><span>累计错次</span></div>
+            </div>
+            <p class="pulse-note">${
+              stats.total ? "答错自动收录，连续答对 2 次即视为掌握。" : "答错的题会自动收进这里，方便集中攻克。"
+            }</p>
+            <div class="pulse-actions">
+              ${
+                stats.pending
+                  ? `<button type="button" class="button button-primary button-small" data-action="start-wrongbook-review" data-scope="pending">${icon("play", 15)}开始攻克 ${stats.pending} 题</button>`
+                  : `<button type="button" class="button button-outline button-small" data-action="go-wrongbook">${icon("target", 15)}查看错题本</button>`
+              }
+              <button type="button" class="text-link" data-action="go-wrongbook">全部错题${icon("arrowRight", 14)}</button>
+            </div>
+          </article>
+
+          <article class="pulse-card">
+            <div class="pulse-head">
+              <span class="pulse-icon">${icon("sparkles", 20)}</span>
+              <div class="pulse-title"><p class="eyebrow">HABIT &amp; BACKUP</p><h3>坚持与备份</h3></div>
+            </div>
+            <div class="pulse-stats pulse-stats-two">
+              <div><strong>${streak}</strong><span>连续学习 · 天</span></div>
+              <div><strong>${totalRounds}</strong><span>累计完成 · 次</span></div>
+            </div>
+            <p class="pulse-note">${
+              streak > 1
+                ? `已经连续 ${streak} 天在练，保持住。`
+                : streak === 1
+                ? "今天已经练过一轮了。"
+                : "完成一轮做题或考试，就会开始记录连续天数。"
+            }</p>
+            <div class="pulse-actions">
+              <button type="button" class="button button-outline button-small" data-action="export-backup">${icon("download", 15)}导出备份</button>
+              <button type="button" class="button button-text" data-action="open-backup">${icon("upload", 15)}导入备份</button>
+            </div>
+          </article>
+        </div>
+      </section>
     `;
   }
 
@@ -731,9 +1283,9 @@
       mode,
       category: initialCategory,
       count: defaultCount(mode, totalInScope),
-      order: "sequential",
+      order: state.prefs.setupOrder === "random" ? "random" : "sequential",
       timed: true,
-      minutes: 30,
+      minutes: state.prefs.examMinutes || 30,
       categories,
     };
     openModal();
@@ -889,11 +1441,67 @@
     renderModal("#setupCategory");
   }
 
+  /**
+   * 统一开启一轮会话。练习/背题/考试、错题重练、错题本、薄弱分类都走这里，
+   * 避免每个入口各写一份 state.session 初始化逻辑。
+   */
+  function beginSession(config) {
+    const questions = Array.isArray(config.questions) ? config.questions.filter(isQuestionShape) : [];
+    if (!questions.length) {
+      toast("当前范围没有题目，请更换范围。", "warning");
+      return false;
+    }
+    if (examClockTimer) {
+      window.clearInterval(examClockTimer);
+      examClockTimer = null;
+    }
+    const mode = config.mode;
+    const now = Date.now();
+    const timed = mode === "exam" ? Boolean(config.timed) : false;
+    const minutes = timed ? Math.max(1, Math.round(Number(config.minutes) || 30)) : 0;
+    state.session = {
+      mode,
+      questions,
+      index: 0,
+      selections: questions.map(() => []),
+      evaluations: questions.map(() => null),
+      flags: questions.map(() => false),
+      startedAt: now,
+      finished: false,
+      isReview: Boolean(config.isReview),
+      exam:
+        mode === "exam"
+          ? {
+              timed,
+              minutes,
+              deadline: timed ? now + minutes * 60 * 1000 : null,
+              autoSubmitted: false,
+            }
+          : null,
+      bankName: state.bank.name,
+      configLabel: config.configLabel || (mode === "exam" ? "完整试卷" : "全部分类"),
+      focusCategories: Array.isArray(config.focusCategories) ? config.focusCategories : null,
+      wrongRecorded: [],
+    };
+    state.result = null;
+    state.modal = null;
+    state.snapshot = null;
+    modalRoot.innerHTML = "";
+    setBodyModal(false);
+    state.route = "session";
+    render();
+    window.scrollTo({ top: 0, behavior: "auto" });
+    if (mode === "exam") startExamClock();
+    flushSessionSnapshot();
+    return true;
+  }
+
   function startSession() {
     if (!state.modal || state.modal.type !== "setup") return;
     const setup = state.modal;
+    let minutes = 0;
     if (setup.mode === "exam" && setup.timed) {
-      const minutes = Number(setup.minutes);
+      minutes = Number(setup.minutes);
       if (!Number.isFinite(minutes) || minutes < 1 || minutes > 300) {
         toast("考试时长需要在 1–300 分钟之间。", "warning");
         const input = document.getElementById("setupMinutes");
@@ -903,41 +1511,26 @@
         }
         return;
       }
-      setup.minutes = Math.round(minutes);
+      minutes = Math.round(minutes);
     }
     const questions = setupQuestions(setup);
     if (!questions.length) {
       toast("当前范围没有题目，请更换范围。", "warning");
       return;
     }
-    const now = Date.now();
-    state.session = {
+    state.prefs = {
+      setupOrder: setup.order === "random" ? "random" : "sequential",
+      examMinutes: setup.mode === "exam" && setup.timed ? minutes : state.prefs.examMinutes || 30,
+    };
+    savePrefs();
+    beginSession({
       mode: setup.mode,
       questions,
-      index: 0,
-      selections: questions.map(() => []),
-      evaluations: questions.map(() => null),
-      flags: questions.map(() => false),
-      startedAt: now,
-      finished: false,
       isReview: false,
-      exam: setup.mode === "exam"
-        ? {
-            timed: Boolean(setup.timed),
-            minutes: setup.timed ? Math.round(Number(setup.minutes)) : 0,
-            deadline: setup.timed ? now + Math.round(Number(setup.minutes)) * 60 * 1000 : null,
-            autoSubmitted: false,
-          }
-        : null,
+      timed: Boolean(setup.timed),
+      minutes,
       configLabel: setup.category === "all" ? "全部分类" : setup.category,
-    };
-    state.modal = null;
-    modalRoot.innerHTML = "";
-    setBodyModal(false);
-    state.route = "session";
-    render();
-    window.scrollTo({ top: 0, behavior: "auto" });
-    if (state.session.mode === "exam") startExamClock();
+    });
   }
 
   /* ----------------------------------------------------------------------- */
@@ -962,7 +1555,36 @@
   }
 
   function sessionModeLabel(session) {
-    return session.isReview ? "错题重练" : MODE_META[session.mode].label;
+    if (session.isReview) return "错题重练";
+    if (session.focusCategories && session.focusCategories.length) return "专项突破";
+    return MODE_META[session.mode].label;
+  }
+
+  function headerCountMarkup(session) {
+    if (session.mode === "exam") {
+      const answered = session.selections.filter((selection) => selection.length).length;
+      return `已答 <b>${answered}</b> <span>/ ${session.questions.length} 题</span>`;
+    }
+    return `第 <b>${session.index + 1}</b> <span>/ ${session.questions.length}</span>`;
+  }
+
+  /** 题目区内部结构：题干、元信息、选项、反馈、页脚。切题时只重建这一块。 */
+  function questionPaneInner(session, question) {
+    const isMemo = session.mode === "memorize";
+    const isExam = session.mode === "exam";
+    return `
+      ${questionTopline(session, question)}
+      <h1 class="question-stem" id="question-stem">${escapeHtml(question.stem)}</h1>
+      <p class="question-instruction">${
+        isMemo
+          ? "答案与解析已展开 · 按自己的节奏记忆"
+          : `${TYPE_META[question.type].hint}${question.type === "multiple" ? (isExam ? " · 可随时修改" : " · 选好后提交") : ""}`
+      }</p>
+      ${renderOptions(session, question)}
+      ${!isMemo && session.mode === "practice" ? renderPracticeFeedback(session, question) : ""}
+      ${isMemo ? renderMemoAnswer(question) : ""}
+      ${renderQuestionFooter(session, question)}
+    `;
   }
 
   function viewSession() {
@@ -972,12 +1594,6 @@
     const isExam = session.mode === "exam";
     const isMemo = session.mode === "memorize";
     const progress = sessionProgress(session);
-    const answeredCount = isExam
-      ? session.selections.filter((selection) => selection.length).length
-      : isMemo
-      ? session.index + 1
-      : session.evaluations.filter(Boolean).length;
-    const modeMeta = MODE_META[session.mode];
     const timerMarkup = isExam
       ? `<div class="exam-timer ${session.exam.timed ? "" : "is-untimed"}" id="examClock">
            ${icon("timer", 17)}<span id="examClockText">${session.exam.timed ? formatClock((session.exam.deadline - Date.now()) / 1000) : "不限时 · 00:00"}</span>
@@ -994,20 +1610,20 @@
               <span class="study-brand">${brandMark("brand-mark-small")}</span>
               <div class="study-title">
                 <strong>${sessionModeLabel(session)}</strong>
-                <span>${escapeHtml(state.bank.name)}</span>
+                <span>${escapeHtml(session.bankName || state.bank.name)}</span>
               </div>
             </div>
             <div class="study-header-center">
-              <span class="study-count">${isExam ? "已答" : "第"} <b>${isExam ? answeredCount : session.index + 1}</b> <span>/ ${session.questions.length}${isExam ? " 题" : ""}</span></span>
+              <span class="study-count" id="studyCountText">${headerCountMarkup(session)}</span>
             </div>
             <div class="study-header-actions">
-              ${!isExam ? `<span class="study-mobile-count">第 <b>${session.index + 1}</b> / ${session.questions.length}</span>` : ""}
+              ${!isExam ? `<span class="study-mobile-count" id="studyMobileCount">第 <b>${session.index + 1}</b> / ${session.questions.length}</span>` : ""}
               ${timerMarkup}
               ${isExam ? `<button type="button" class="button button-primary button-small study-submit" data-action="request-submit-exam">${icon("check", 16)}交卷</button>` : ""}
             </div>
           </div>
           <div class="study-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}" aria-label="本轮进度">
-            <span style="width:${progress}%"></span>
+            <span id="studyProgressFill" style="width:${progress}%"></span>
           </div>
         </header>
 
@@ -1015,17 +1631,7 @@
 
         <main class="session-main">
           <section class="question-card ${isMemo ? "question-card-memo" : ""}" aria-labelledby="question-stem">
-            ${questionTopline(session, question)}
-            <h1 class="question-stem" id="question-stem">${escapeHtml(question.stem)}</h1>
-            <p class="question-instruction">${
-              isMemo
-                ? "答案与解析已展开 · 按自己的节奏记忆"
-                : `${TYPE_META[question.type].hint}${question.type === "multiple" ? (isExam ? " · 可随时修改" : " · 选好后提交") : ""}`
-            }</p>
-            ${renderOptions(session, question)}
-            ${!isMemo && session.mode === "practice" ? renderPracticeFeedback(session, question) : ""}
-            ${isMemo ? renderMemoAnswer(question) : ""}
-            ${renderQuestionFooter(session, question)}
+            ${questionPaneInner(session, question)}
           </section>
           <aside class="session-aside">
             ${renderAside(session)}
@@ -1060,59 +1666,61 @@
     `;
   }
 
-  function renderOptions(session, question) {
+  /**
+   * 单个选项的视觉状态。渲染与局部更新共用同一份计算，避免两套判断。
+   */
+  function optionViewState(session, question, option) {
     const isMemo = session.mode === "memorize";
-    const isExam = session.mode === "exam";
     const evaluation = session.evaluations[session.index];
     const selected = session.selections[session.index] || [];
-    const submitted = Boolean(evaluation);
+    const submitted = Boolean(evaluation) && !isMemo;
+    const isSelected = selected.includes(option.key);
+    const isAnswer = question.answer.includes(option.key);
+    const isCorrect = submitted && isAnswer;
+    const isWrong = submitted && isSelected && !isAnswer;
+    const classes = [
+      "option",
+      isMemo ? "is-readonly" : "",
+      isAnswer && isMemo ? "is-answer" : "",
+      isSelected && !submitted ? "is-selected" : "",
+      isCorrect ? "is-correct" : "",
+      isWrong ? "is-wrong" : "",
+      submitted ? "is-locked" : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    let trailing = "";
+    if (submitted) {
+      if (isCorrect) trailing = `<span class="option-status status-correct">${icon("check", 15)}正确答案</span>`;
+      else if (isWrong) trailing = `<span class="option-status status-wrong">${icon("close", 14)}你的答案</span>`;
+    } else if (isMemo && isAnswer) {
+      trailing = `<span class="option-status status-correct">${icon("check", 15)}正确答案</span>`;
+    } else if (isSelected) {
+      trailing = `<span class="option-check">${icon("check", 14)}</span>`;
+    }
+    return { classes, trailing, disabled: submitted, pressed: isSelected };
+  }
+
+  function renderOptions(session, question) {
+    const isMemo = session.mode === "memorize";
     return `
       <div class="option-list" role="group" aria-label="答案选项">
         ${question.options
           .map((option) => {
-            const isSelected = selected.includes(option.key);
-            const isAnswer = question.answer.includes(option.key);
-            const showResult = submitted;
-            const isCorrect = showResult && isAnswer;
-            const isWrong = showResult && isSelected && !isAnswer;
-            const classes = [
-              "option",
-              isMemo ? "is-readonly" : "",
-              isAnswer && isMemo ? "is-answer" : "",
-              isSelected && !showResult ? "is-selected" : "",
-              isCorrect ? "is-correct" : "",
-              isWrong ? "is-wrong" : "",
-              showResult ? "is-locked" : "",
-            ]
-              .filter(Boolean)
-              .join(" ");
-            const trailing = showResult
-              ? isCorrect
-                ? `<span class="option-status status-correct">${icon("check", 15)}正确答案</span>`
-                : isWrong
-                ? `<span class="option-status status-wrong">${icon("close", 14)}你的答案</span>`
-                : isSelected
-                ? `<span class="option-status status-wrong">${icon("close", 14)}你的答案</span>`
-                : ""
-              : isMemo && isAnswer
-              ? `<span class="option-status status-correct">${icon("check", 15)}正确答案</span>`
-              : isSelected
-              ? `<span class="option-check">${icon("check", 14)}</span>`
-              : "";
-
+            const view = optionViewState(session, question, option);
             if (isMemo) {
               return `
-                <div class="${classes}">
+                <div class="${view.classes}">
                   <span class="option-key">${option.key}</span>
                   <span class="option-copy">${escapeHtml(option.text)}</span>
-                  ${trailing}
+                  ${view.trailing}
                 </div>`;
             }
             return `
-              <button type="button" class="${classes}" data-action="select-option" data-key="${option.key}" aria-pressed="${isSelected}" ${showResult ? "disabled" : ""}>
+              <button type="button" class="${view.classes}" data-action="select-option" data-key="${option.key}" aria-pressed="${view.pressed}" ${view.disabled ? "disabled" : ""}>
                 <span class="option-key">${option.key}</span>
                 <span class="option-copy">${escapeHtml(option.text)}</span>
-                ${trailing}
+                ${view.trailing}
               </button>`;
           })
           .join("")}
@@ -1120,17 +1728,35 @@
     `;
   }
 
+  /** 多选题错因：区分漏选与多选，题/单选返回空字符串。 */
+  function wrongReasonText(question, evaluation) {
+    if (!evaluation || evaluation.isCorrect || question.type !== "multiple") return "";
+    const selected = Array.isArray(evaluation.selected) ? evaluation.selected : [];
+    const missing = question.answer.filter((key) => !selected.includes(key));
+    const extra = selected.filter((key) => !question.answer.includes(key));
+    const parts = [];
+    if (missing.length) {
+      parts.push(`漏选了 ${missing.map((key) => `${key}. ${optionText(question, key)}`).join("、")}`);
+    }
+    if (extra.length) {
+      parts.push(`多选了 ${extra.map((key) => `${key}. ${optionText(question, key)}`).join("、")}`);
+    }
+    if (!parts.length) return "";
+    return `${parts.join("；")}。多选题需要与正确答案完全一致。`;
+  }
+
   function renderPracticeFeedback(session, question) {
     const evaluation = session.evaluations[session.index];
     if (!evaluation) return "";
     const isCorrect = evaluation.isCorrect;
+    const reason = wrongReasonText(question, evaluation);
     return `
       <section class="feedback ${isCorrect ? "feedback-correct" : "feedback-wrong"}" aria-live="polite">
         <div class="feedback-heading">
           <span class="feedback-icon">${icon(isCorrect ? "check" : "close", 20)}</span>
           <div>
             <h3>${isCorrect ? "回答正确" : "这题答错了"}</h3>
-            <p>${isCorrect ? "判断准确，继续下一题。" : "看一眼解析，把这一分捡回来。"}</p>
+            <p>${isCorrect ? "判断准确，继续下一题。" : escapeHtml(reason || "看一眼解析，把这一分捡回来。")}</p>
           </div>
           <span class="feedback-answer">正确答案 <b>${escapeHtml(shortAnswer(question, question.answer))}</b></span>
         </div>
@@ -1138,6 +1764,14 @@
           <span>你的答案</span>
           <strong>${escapeHtml(displayAnswer(question, evaluation.selected))}</strong>
         </div>
+        ${
+          isCorrect
+            ? ""
+            : `<div class="feedback-retry">
+                 <span>想自己再想一遍？这会重置本题作答，不影响整轮统计。</span>
+                 <button type="button" class="button button-outline button-small" data-action="retry-question">${icon("rotate", 15)}再答一次</button>
+               </div>`
+        }
         <div class="analysis-block">
           <span class="analysis-label">${icon("sparkles", 15)}解析</span>
           <p>${question.analysis ? escapeHtml(question.analysis) : "这道题暂时没有解析。"}</p>
@@ -1162,6 +1796,17 @@
   }
 
   function renderQuestionFooter(session, question) {
+    const isMemo = session.mode === "memorize";
+    const classes = isMemo
+      ? "question-footer memo-footer"
+      : session.mode === "exam"
+      ? "question-footer exam-question-footer"
+      : "question-footer";
+    return `<footer class="${classes}">${questionFooterInner(session, question)}</footer>`;
+  }
+
+  /** 页脚内容（不含 footer 节点本身），便于提交答案后就地替换。 */
+  function questionFooterInner(session, question) {
     const isExam = session.mode === "exam";
     const isMemo = session.mode === "memorize";
     const isPractice = session.mode === "practice";
@@ -1172,48 +1817,39 @@
     if (isPractice) {
       if (evaluation) {
         return `
-          <footer class="question-footer">
-            <span class="footer-note">${evaluation.isCorrect ? "保持节奏，继续向前。" : "弄懂比做对更重要。"}</span>
-            <button type="button" class="button button-primary" data-action="next-question">
-              ${isLast ? "查看练习小结" : "下一题"}${icon("arrowRight", 18)}
-            </button>
-          </footer>`;
+          <span class="footer-note">${evaluation.isCorrect ? "保持节奏，继续向前。" : "弄懂比做对更重要。"}</span>
+          <button type="button" class="button button-primary" data-action="next-question">
+            ${isLast ? "查看练习小结" : "下一题"}${icon("arrowRight", 18)}
+          </button>`;
       }
       return `
-        <footer class="question-footer">
-          <span class="footer-note">${selected.length ? `已选择 ${shortAnswer(question, selected)}` : "选择答案后提交"}</span>
-          <button type="button" class="button button-primary" data-action="submit-answer" ${selected.length ? "" : "disabled"}>
-            提交答案${icon("arrowRight", 18)}
-          </button>
-        </footer>`;
+        <span class="footer-note">${selected.length ? `已选择 ${shortAnswer(question, selected)}` : "选择答案后提交"}</span>
+        <button type="button" class="button button-primary" data-action="submit-answer" ${selected.length ? "" : "disabled"}>
+          提交答案${icon("arrowRight", 18)}
+        </button>`;
     }
 
     if (isMemo) {
       return `
-        <footer class="question-footer memo-footer">
-          <button type="button" class="button button-outline" data-action="prev-question" ${session.index === 0 ? "disabled" : ""}>
-            ${icon("arrowLeft", 17)}上一题
-          </button>
-          <span class="footer-position">${session.index + 1} / ${session.questions.length}</span>
-          <button type="button" class="button button-primary" data-action="${isLast ? "finish-memorize" : "next-question"}">
-            ${isLast ? "完成背题" : "下一题"}${icon("arrowRight", 18)}
-          </button>
-        </footer>`;
-    }
-
-    return `
-      <footer class="question-footer exam-question-footer">
         <button type="button" class="button button-outline" data-action="prev-question" ${session.index === 0 ? "disabled" : ""}>
           ${icon("arrowLeft", 17)}上一题
         </button>
-        <span class="footer-position">${isExam ? (selected.length ? `已选 ${shortAnswer(question, selected)}` : "本题尚未作答") : `${session.index + 1} / ${session.questions.length}`}</span>
-        ${
-          isLast
-            ? `<button type="button" class="button button-primary" data-action="request-submit-exam">${icon("check", 17)}交卷</button>`
-            : `<button type="button" class="button button-ink" data-action="next-question">下一题${icon("arrowRight", 18)}</button>`
-        }
-      </footer>
-    `;
+        <span class="footer-position">${session.index + 1} / ${session.questions.length}</span>
+        <button type="button" class="button button-primary" data-action="${isLast ? "finish-memorize" : "next-question"}">
+          ${isLast ? "完成背题" : "下一题"}${icon("arrowRight", 18)}
+        </button>`;
+    }
+
+    return `
+      <button type="button" class="button button-outline" data-action="prev-question" ${session.index === 0 ? "disabled" : ""}>
+        ${icon("arrowLeft", 17)}上一题
+      </button>
+      <span class="footer-position">${isExam ? (selected.length ? `已选 ${shortAnswer(question, selected)}` : "本题尚未作答") : `${session.index + 1} / ${session.questions.length}`}</span>
+      ${
+        isLast
+          ? `<button type="button" class="button button-primary" data-action="request-submit-exam">${icon("check", 17)}交卷</button>`
+          : `<button type="button" class="button button-ink" data-action="next-question">下一题${icon("arrowRight", 18)}</button>`
+      }`;
   }
 
   function renderAside(session) {
@@ -1222,12 +1858,12 @@
     return renderPracticeAside(session);
   }
 
-  function progressRing(percent, label, value) {
+  function progressRing(percent, label, value, ringId, valueId) {
     const angle = Math.max(0, Math.min(100, percent)) * 3.6;
     return `
-      <div class="progress-ring" style="--ring-angle:${angle}deg">
+      <div class="progress-ring"${ringId ? ` id="${ringId}"` : ""} style="--ring-angle:${angle}deg">
         <div class="progress-ring-inner">
-          <strong>${value}</strong>
+          <strong${valueId ? ` id="${valueId}"` : ""}>${value}</strong>
           <span>${label}</span>
         </div>
       </div>`;
@@ -1240,12 +1876,12 @@
     const percent = Math.round((completed / session.questions.length) * 100);
     return `
       <div class="aside-card">
-        <div class="aside-heading"><span>本轮进度</span><span class="aside-soft">${completed} / ${session.questions.length}</span></div>
+        <div class="aside-heading"><span>本轮进度</span><span class="aside-soft" id="asideCompleted">${completed} / ${session.questions.length}</span></div>
         <div class="aside-progress-flex">
-          ${progressRing(percent, "已完成", `${percent}%`)}
+          ${progressRing(percent, "已完成", `${percent}%`, "asideProgressRing", "asideRingValue")}
           <div class="aside-mini-stats">
-            <div><span class="stat-dot stat-green"></span><strong>${correct}</strong><small>答对</small></div>
-            <div><span class="stat-dot stat-red"></span><strong>${wrong}</strong><small>答错</small></div>
+            <div><span class="stat-dot stat-green"></span><strong id="asideCorrect">${correct}</strong><small>答对</small></div>
+            <div><span class="stat-dot stat-red"></span><strong id="asideWrong">${wrong}</strong><small>答错</small></div>
           </div>
         </div>
         <div class="aside-divider"></div>
@@ -1278,9 +1914,9 @@
     const percent = Math.round(((session.index + 1) / session.questions.length) * 100);
     return `
       <div class="aside-card">
-        <div class="aside-heading"><span>浏览进度</span><span class="aside-soft">${session.index + 1} / ${session.questions.length}</span></div>
+        <div class="aside-heading"><span>浏览进度</span><span class="aside-soft" id="asideCompleted">${session.index + 1} / ${session.questions.length}</span></div>
         <div class="aside-progress-flex">
-          ${progressRing(percent, "已浏览", `${percent}%`)}
+          ${progressRing(percent, "已浏览", `${percent}%`, "asideProgressRing", "asideRingValue")}
           <div class="aside-memo-note">
             <strong>答案常显</strong>
             <span>先读题，再看选项与解析，建立完整印象。</span>
@@ -1310,7 +1946,7 @@
     const flagged = session.flags.filter(Boolean).length;
     return `
       <div class="aside-card exam-map-card">
-        <div class="aside-heading"><span>答题卡</span><span class="aside-soft">${answered} / ${session.questions.length} 已答</span></div>
+        <div class="aside-heading"><span>答题卡</span><span class="aside-soft" id="asideExamAnswered">${answered} / ${session.questions.length} 已答</span></div>
         <div class="exam-map" aria-label="考试答题卡">
           ${session.questions
             .map((_, index) => {
@@ -1334,8 +1970,8 @@
           <span><i class="legend-flag">${icon("flag", 12)}</i>标记</span>
         </div>
         <div class="exam-aside-stats">
-          <div><strong>${session.questions.length - answered}</strong><span>未作答</span></div>
-          <div><strong>${flagged}</strong><span>已标记</span></div>
+          <div><strong id="examUnanswered">${session.questions.length - answered}</strong><span>未作答</span></div>
+          <div><strong id="examFlagged">${flagged}</strong><span>已标记</span></div>
         </div>
         <button type="button" class="button button-primary button-wide" data-action="request-submit-exam">${icon("check", 17)}提交试卷</button>
         <div class="aside-tip">${icon("info", 15)}<span>${session.exam.timed ? "倒计时结束后会自动交卷，作答不会显示对错。" : "不限时考试会记录你的总用时，不显示对错。"}</span></div>
@@ -1351,7 +1987,7 @@
   function mobileExamPalette(session) {
     return `
       <div class="mobile-exam-palette">
-        <div class="mobile-palette-head"><span>答题卡</span><span>已答 ${session.selections.filter((selection) => selection.length).length} / ${session.questions.length}</span></div>
+        <div class="mobile-palette-head"><span>答题卡</span><span id="mobilePaletteCount">已答 ${session.selections.filter((selection) => selection.length).length} / ${session.questions.length}</span></div>
         <div class="mobile-palette-scroll">
           ${session.questions
             .map((_, index) => {
@@ -1371,6 +2007,165 @@
     `;
   }
 
+  /* ----------------------------------------------------------------------- */
+  /* Targeted DOM updates (avoid full re-render inside a session)            */
+  /* ----------------------------------------------------------------------- */
+
+  function setText(id, value) {
+    const node = document.getElementById(id);
+    if (node) node.textContent = String(value);
+  }
+
+  function setRing(percent) {
+    const safe = Math.max(0, Math.min(100, percent));
+    const ring = document.getElementById("asideProgressRing");
+    if (ring) ring.style.setProperty("--ring-angle", `${safe * 3.6}deg`);
+    setText("asideRingValue", `${safe}%`);
+  }
+
+  /** 头部计数与进度条（不触碰题目与答题卡）。 */
+  function updateHeader(session) {
+    const count = document.getElementById("studyCountText");
+    if (count) count.innerHTML = headerCountMarkup(session);
+    const mobile = document.getElementById("studyMobileCount");
+    if (mobile) mobile.innerHTML = `第 <b>${session.index + 1}</b> / ${session.questions.length}`;
+    const progress = sessionProgress(session);
+    const fill = document.getElementById("studyProgressFill");
+    if (fill) fill.style.width = `${progress}%`;
+    const bar = document.querySelector(".study-progress");
+    if (bar) bar.setAttribute("aria-valuenow", String(progress));
+  }
+
+  /** 侧栏统计与答题卡计数。 */
+  function updateAsideStats(session) {
+    const total = session.questions.length;
+    if (session.mode === "practice") {
+      const done = session.evaluations.filter(Boolean).length;
+      const correct = session.evaluations.filter((entry) => entry && entry.isCorrect).length;
+      setText("asideCompleted", `${done} / ${total}`);
+      setText("asideCorrect", correct);
+      setText("asideWrong", done - correct);
+      setRing(total ? Math.round((done / total) * 100) : 0);
+      return;
+    }
+    if (session.mode === "memorize") {
+      setText("asideCompleted", `${session.index + 1} / ${total}`);
+      setRing(total ? Math.round(((session.index + 1) / total) * 100) : 0);
+      return;
+    }
+    const answered = session.selections.filter((selection) => selection.length).length;
+    const flagged = session.flags.filter(Boolean).length;
+    setText("asideExamAnswered", `${answered} / ${total} 已答`);
+    setText("examUnanswered", total - answered);
+    setText("examFlagged", flagged);
+    setText("mobilePaletteCount", `已答 ${answered} / ${total}`);
+  }
+
+  /** 就地更新选项节点：class / aria-pressed / 勾选标记，不重建列表。 */
+  function updateOptionNodes(session, question) {
+    if (session.mode === "memorize") return;
+    const list = document.querySelector(".option-list");
+    if (!list) return;
+    const nodes = list.querySelectorAll(".option");
+    for (let i = 0; i < nodes.length; i += 1) {
+      const node = nodes[i];
+      const option = question.options[i];
+      if (!option || node.dataset.key !== option.key) continue;
+      const view = optionViewState(session, question, option);
+      if (node.className !== view.classes) node.className = view.classes;
+      node.setAttribute("aria-pressed", view.pressed ? "true" : "false");
+      if (view.disabled) node.setAttribute("disabled", "");
+      else node.removeAttribute("disabled");
+      const trailing = node.querySelector(".option-check, .option-status");
+      if (trailing) trailing.remove();
+      if (view.trailing) node.insertAdjacentHTML("beforeend", view.trailing);
+    }
+  }
+
+  function updateFooter(session, question) {
+    const footer = document.querySelector(".question-footer");
+    if (!footer) return;
+    footer.innerHTML = questionFooterInner(session, question);
+  }
+
+  /** 插入 / 移除练习反馈区，可选滚动到可见位置。 */
+  function updateFeedback(session, question, scrollIntoView) {
+    const list = document.querySelector(".option-list");
+    if (!list) return;
+    const existing = document.querySelector(".feedback");
+    if (existing) existing.remove();
+    const markup = session.mode === "practice" ? renderPracticeFeedback(session, question) : "";
+    if (markup) list.insertAdjacentHTML("afterend", markup);
+    if (markup && scrollIntoView) {
+      window.requestAnimationFrame(() => {
+        const feedback = document.querySelector(".feedback");
+        if (feedback) feedback.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      });
+    }
+  }
+
+  function updatePracticeDots(session, indices) {
+    const dots = document.querySelectorAll(".mini-map .mini-map-dot");
+    if (!dots.length) return;
+    const targets = indices || session.questions.map((_, index) => index);
+    targets.forEach((index) => {
+      const dot = dots[index];
+      if (!dot) return;
+      const evaluation = session.evaluations[index];
+      dot.classList.toggle("is-correct", Boolean(evaluation && evaluation.isCorrect));
+      dot.classList.toggle("is-wrong", Boolean(evaluation && !evaluation.isCorrect));
+      dot.classList.toggle("is-current", index === session.index);
+    });
+  }
+
+  function updateExamDots(session, indices) {
+    const targets = indices || session.questions.map((_, index) => index);
+    targets.forEach((index) => {
+      const answered = Boolean(session.selections[index] && session.selections[index].length);
+      const flagged = Boolean(session.flags[index]);
+      const nodes = document.querySelectorAll(`.exam-map-dot[data-index="${index}"]`);
+      for (let i = 0; i < nodes.length; i += 1) {
+        const dot = nodes[i];
+        dot.classList.toggle("is-answered", answered);
+        dot.classList.toggle("is-current", index === session.index);
+        dot.classList.toggle("is-flagged", flagged);
+        dot.setAttribute(
+          "aria-label",
+          `第 ${index + 1} 题${answered ? "，已作答" : "，未作答"}${flagged ? "，已标记" : ""}`
+        );
+      }
+    });
+  }
+
+  function updateMemoDots(session) {
+    const dots = document.querySelectorAll(".mini-map.is-clickable .mini-map-dot");
+    for (let i = 0; i < dots.length; i += 1) {
+      dots[i].classList.toggle("is-current", i === session.index);
+      dots[i].classList.toggle("is-visited", i !== session.index);
+    }
+  }
+
+  /** 切题：只重建题目区内部 HTML。 */
+  function swapQuestionPane(session) {
+    const card = document.querySelector(".question-card");
+    const question = currentQuestion();
+    if (!card || !question) {
+      render(true);
+      return;
+    }
+    card.innerHTML = questionPaneInner(session, question);
+  }
+
+  function syncAfterIndexChange(session, previousIndex) {
+    swapQuestionPane(session);
+    updateHeader(session);
+    updateAsideStats(session);
+    if (session.mode === "exam") updateExamDots(session, [previousIndex, session.index]);
+    if (session.mode === "practice") updatePracticeDots(session, [previousIndex, session.index]);
+    if (session.mode === "memorize") updateMemoDots(session);
+    scheduleSessionSave();
+  }
+
   function selectOption(key) {
     const session = state.session;
     if (!session || session.mode === "memorize") return;
@@ -1386,7 +2181,14 @@
     } else {
       session.selections[session.index] = [key];
     }
-    render(true);
+    updateOptionNodes(session, question);
+    updateFooter(session, question);
+    if (session.mode === "exam") {
+      updateExamDots(session, [session.index]);
+      updateAsideStats(session);
+      updateHeader(session);
+    }
+    scheduleSessionSave();
   }
 
   function submitPracticeAnswer() {
@@ -1398,15 +2200,47 @@
       toast("先选择一个答案再提交。", "warning");
       return;
     }
-    session.evaluations[session.index] = {
-      selected: [...selected],
-      isCorrect: sameKeys(selected, question.answer),
-    };
-    render(true);
-    window.requestAnimationFrame(() => {
-      const feedback = document.querySelector(".feedback");
-      if (feedback) feedback.scrollIntoView({ behavior: "smooth", block: "nearest" });
-    });
+    const isCorrect = sameKeys(selected, question.answer);
+    const evaluation = { selected: [...selected], isCorrect };
+    if (!isCorrect && question.type === "multiple") {
+      evaluation.missing = question.answer.filter((key) => !selected.includes(key));
+      evaluation.extra = selected.filter((key) => !question.answer.includes(key));
+    }
+    session.evaluations[session.index] = evaluation;
+
+    /* 错题本按本轮首次错误计入；之后「再答一次」不再重复累加错误次数。 */
+    if (isCorrect) {
+      recordCorrectQuestion(question);
+    } else if (!session.wrongRecorded.includes(session.index)) {
+      recordWrongQuestion(question);
+      session.wrongRecorded.push(session.index);
+    }
+
+    updateOptionNodes(session, question);
+    updateFeedback(session, question, true);
+    updateFooter(session, question);
+    updateAsideStats(session);
+    updateHeader(session);
+    updatePracticeDots(session, [session.index]);
+    flushSessionSnapshot();
+  }
+
+  /** 练习模式答错后重做本题：只重置本题状态。 */
+  function retryQuestion() {
+    const session = state.session;
+    if (!session || session.mode !== "practice") return;
+    const question = currentQuestion();
+    if (!question) return;
+    const index = session.index;
+    session.selections[index] = [];
+    session.evaluations[index] = null;
+    updateOptionNodes(session, question);
+    updateFeedback(session, question, false);
+    updateFooter(session, question);
+    updateAsideStats(session);
+    updateHeader(session);
+    updatePracticeDots(session, [index]);
+    scheduleSessionSave();
   }
 
   function goToQuestion(index) {
@@ -1414,8 +2248,9 @@
     if (!session) return;
     const nextIndex = Math.max(0, Math.min(session.questions.length - 1, Number(index)));
     if (!Number.isFinite(nextIndex) || nextIndex === session.index) return;
+    const previousIndex = session.index;
     session.index = nextIndex;
-    render(true);
+    syncAfterIndexChange(session, previousIndex);
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
@@ -1431,24 +2266,35 @@
       if (session.mode === "memorize") finishMemorize();
       return;
     }
+    const previousIndex = session.index;
     session.index += 1;
-    render(true);
+    syncAfterIndexChange(session, previousIndex);
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   function prevQuestion() {
     const session = state.session;
     if (!session || session.index === 0) return;
+    const previousIndex = session.index;
     session.index -= 1;
-    render(true);
+    syncAfterIndexChange(session, previousIndex);
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   function toggleFlag() {
     const session = state.session;
     if (!session || session.mode !== "exam") return;
-    session.flags[session.index] = !session.flags[session.index];
-    render(true);
+    const active = !session.flags[session.index];
+    session.flags[session.index] = active;
+    const button = document.querySelector(".flag-button");
+    if (button) {
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-pressed", active ? "true" : "false");
+      button.innerHTML = `${icon("flag", 16)}${active ? "已标记" : "标记"}`;
+    }
+    updateExamDots(session, [session.index]);
+    updateAsideStats(session);
+    scheduleSessionSave();
   }
 
   function finishPractice() {
@@ -1466,7 +2312,7 @@
     const correctCount = questions.filter((entry) => entry.isCorrect).length;
     const result = {
       mode: "practice",
-      bankName: state.bank.name,
+      bankName: session.bankName || state.bank.name,
       finishedAt: Date.now(),
       total: questions.length,
       correctCount,
@@ -1487,7 +2333,7 @@
     if (!session) return;
     const result = {
       mode: "memorize",
-      bankName: state.bank.name,
+      bankName: session.bankName || state.bank.name,
       finishedAt: Date.now(),
       total: session.questions.length,
       categories: uniqueCategories(session.questions),
@@ -1523,6 +2369,7 @@
     }
     state.result = result;
     state.session = null;
+    clearSessionSnapshot();
     state.modal = null;
     modalRoot.innerHTML = "";
     setBodyModal(false);
@@ -1567,6 +2414,15 @@
     if (examClockTimer) window.clearInterval(examClockTimer);
     updateExamClock();
     examClockTimer = window.setInterval(updateExamClock, 1000);
+  }
+
+  /**
+   * 从后台标签页或窗口失焦回来时立即校准倒计时：
+   * 隐藏标签页的 setInterval 会被浏览器降频，可能延迟自动交卷。
+   */
+  function refreshExamClock() {
+    if (!state.session || state.session.mode !== "exam" || state.session.finished) return;
+    updateExamClock();
   }
 
   function openSubmitExamModal() {
@@ -1614,9 +2470,16 @@
     const unansweredCount = questions.filter((entry) => entry.unanswered).length;
     const score = questions.reduce((sum, entry) => sum + entry.earned, 0);
     const maxScore = totalScore(session.questions);
+
+    /* 交卷时把错题与未作答一并收进错题本（未作答按答错计），一次性写入。 */
+    questions.forEach((entry) => {
+      if (!entry.isCorrect) recordWrongQuestion(entry.question, true);
+    });
+    saveWrongbook(true);
+
     const result = {
       mode: "exam",
-      bankName: state.bank.name,
+      bankName: session.bankName || state.bank.name,
       finishedAt: Date.now(),
       total: questions.length,
       correctCount,
@@ -1648,17 +2511,17 @@
   function requestExit() {
     if (!state.session) return;
     const session = state.session;
+    const exam = session.mode === "exam";
     state.modal = {
       type: "confirm",
-      title: session.mode === "exam" ? "确定退出考试？" : "结束本轮学习？",
-      message:
-        session.mode === "exam"
-          ? "考试进行中。退出后本场考试不会计分，已作答的内容也会清空。"
-          : session.mode === "memorize"
-          ? "退出后将回到首页，本轮背题进度不会保留。"
-          : "本轮答题进度将不会保留，确定返回首页吗？",
-      detail: "你随时可以重新开始一轮。",
-      confirmLabel: session.mode === "exam" ? "退出考试" : "退出本轮",
+      title: exam ? "确定退出考试？" : "结束本轮学习？",
+      message: exam
+        ? "考试进行中。退出后本场考试不会计分，已作答的内容也会清空。"
+        : session.mode === "memorize"
+        ? "退出后将回到首页，本轮背题进度不会保留。"
+        : "本轮答题进度将不会保留，确定返回首页吗？",
+      detail: "离开页面前系统会自动保存进度，回来可以接着做；主动退出则会清空本轮。",
+      confirmLabel: exam ? "退出考试" : "退出本轮",
       cancelLabel: "继续学习",
       danger: true,
       callback: () => {
@@ -1667,6 +2530,7 @@
           examClockTimer = null;
         }
         state.session = null;
+        clearSessionSnapshot();
         state.route = "home";
         state.modal = null;
         modalRoot.innerHTML = "";
@@ -1679,34 +2543,58 @@
     openModal();
   }
 
+  /** 成绩页「重练 X 道错题」：题目内容优先取错题本快照，保证与错题本一致。 */
   function startWrongReview(result) {
     const wrongEntries = result.questions.filter((entry) => !entry.isCorrect);
-    const questions = wrongEntries.map((entry) => entry.question);
-    if (!questions.length) return;
-    if (examClockTimer) {
-      window.clearInterval(examClockTimer);
-      examClockTimer = null;
+    if (!wrongEntries.length) return;
+    const questions = wrongEntries.map((entry) => {
+      const stored = findWrongEntry(entry.question);
+      return stored ? { ...stored.question } : entry.question;
+    });
+    beginSession({ mode: "practice", questions, isReview: true, configLabel: "错题重练" });
+  }
+
+  /** 错题本页面 / 首页「开始攻克」：只练当前筛选出来的题。 */
+  function startWrongbookReview(pendingOnly) {
+    const entries = pendingOnly
+      ? sortedWrongbook().filter((entry) => !entry.mastered)
+      : filteredWrongbook();
+    if (!entries.length) {
+      toast("当前筛选下没有可练习的错题。", "warning");
+      return;
     }
-    state.session = {
+    const questions = entries.map((entry) => ({ ...entry.question }));
+    beginSession({ mode: "practice", questions, isReview: true, configLabel: "错题本" });
+  }
+
+  function practiceWrongItem(key) {
+    const entry = state.wrongbook.find((item) => item.key === key);
+    if (!entry) {
+      toast("这道错题已经不在错题本里了。", "warning");
+      return;
+    }
+    beginSession({ mode: "practice", questions: [{ ...entry.question }], isReview: true, configLabel: "单题攻克" });
+  }
+
+  /** 成绩页「专练薄弱分类」：锁定正确率最低的几个分类。 */
+  function startCategoryPractice(categories) {
+    const targets = Array.isArray(categories) ? categories.filter((item) => typeof item === "string") : [];
+    if (!targets.length) {
+      toast("没有可练习的分类。", "warning");
+      return;
+    }
+    const questions = state.bank.questions.filter((question) => targets.includes(question.category || "未分类"));
+    if (!questions.length) {
+      toast("这些分类在当前题库里没有题目。", "warning");
+      return;
+    }
+    beginSession({
       mode: "practice",
       questions,
-      index: 0,
-      selections: questions.map(() => []),
-      evaluations: questions.map(() => null),
-      flags: questions.map(() => false),
-      startedAt: Date.now(),
-      finished: false,
-      isReview: true,
-      exam: null,
-      configLabel: "错题重练",
-    };
-    state.result = null;
-    state.modal = null;
-    modalRoot.innerHTML = "";
-    setBodyModal(false);
-    state.route = "session";
-    render();
-    window.scrollTo({ top: 0, behavior: "auto" });
+      isReview: false,
+      configLabel: targets.join("、"),
+      focusCategories: targets,
+    });
   }
 
   function restartMode(mode) {
@@ -1715,6 +2603,207 @@
     render();
     window.scrollTo({ top: 0, behavior: "auto" });
     window.setTimeout(() => openSetup(mode), 30);
+  }
+
+  /* ----------------------------------------------------------------------- */
+  /* Wrong book page                                                         */
+  /* ----------------------------------------------------------------------- */
+
+  function wrongbookEmpty(stats) {
+    if (!stats.total) {
+      return `
+        <div class="wrongbook-empty">
+          <span class="empty-records-icon">${icon("target", 26)}</span>
+          <h3>错题本还是空的</h3>
+          <p>在做题或考试中答错的题会自动收进这里，方便集中攻克。</p>
+          <button type="button" class="button button-primary" data-action="open-setup" data-mode="practice">${icon("play", 16)}开始做题</button>
+        </div>`;
+    }
+    return `
+      <div class="wrongbook-empty">
+        <span class="empty-records-icon">${icon("check", 26)}</span>
+        <h3>这个筛选下没有题目</h3>
+        <p>换个筛选看看，或者继续做题积累新的错题。</p>
+        <button type="button" class="button button-outline" data-action="set-wrong-filter" data-value="all">查看全部错题</button>
+      </div>`;
+  }
+
+  function wrongbookItem(entry) {
+    const question = entry.question;
+    return `
+      <article class="wrongbook-item ${entry.mastered ? "is-mastered" : ""}">
+        <div class="wrongbook-item-top">
+          <span class="wrongbook-count">错 ${entry.wrongCount} 次</span>
+          ${typeBadge(question.type)}
+          <span class="meta-chip">${escapeHtml(question.category || "未分类")}</span>
+          <span class="wrongbook-state ${entry.mastered ? "is-mastered" : ""}">${
+            entry.mastered ? "已掌握" : `连对 ${Math.min(Number(entry.rightStreak) || 0, 2)}/2`
+          }</span>
+        </div>
+        <h3 class="wrongbook-stem">${escapeHtml(question.stem)}</h3>
+        <div class="wrongbook-meta">
+          <span>正确答案 <b>${escapeHtml(shortAnswer(question, question.answer))}</b></span>
+          ${entry.lastWrongAt ? `<span>上次答错 ${formatDate(entry.lastWrongAt, true)}</span>` : ""}
+        </div>
+        <div class="wrongbook-item-actions">
+          <button type="button" class="button button-outline button-small" data-action="practice-wrong-item" data-key="${escapeHtml(entry.key)}">${icon("play", 14)}单独练</button>
+          <button type="button" class="text-button" data-action="remove-wrong" data-key="${escapeHtml(entry.key)}">${icon("trash", 14)}移出错题本</button>
+        </div>
+      </article>
+    `;
+  }
+
+  function viewWrongbook() {
+    const stats = wrongbookStats();
+    const entries = filteredWrongbook();
+    const filters = ["all", "pending", "mastered"].map((value) => {
+      const count = value === "all" ? stats.total : value === "pending" ? stats.pending : stats.mastered;
+      return `<button type="button" class="segment ${state.wrongFilter === value ? "is-active" : ""}" data-action="set-wrong-filter" data-value="${value}" aria-pressed="${
+        state.wrongFilter === value
+      }">${WRONGBOOK_FILTERS[value].label} ${count}</button>`;
+    });
+
+    return `
+      <div class="site-shell wrongbook-shell">
+        <header class="site-header">
+          <div class="site-header-inner">
+            <a class="brand" href="#" data-action="go-home" aria-label="小点刷题首页">
+              ${brandMark()}
+              <span class="brand-copy"><strong>小点刷题</strong><small>WRONG BOOK</small></span>
+            </a>
+            <div class="header-actions">
+              <span class="save-status ${state.storageOk ? "" : "is-warning"}"><span class="save-dot"></span>${
+                state.storageOk ? "已保存在本机" : "仅本次有效"
+              }</span>
+              <button type="button" class="button button-outline button-small" data-action="go-home">${icon("home", 16)}返回首页</button>
+            </div>
+          </div>
+        </header>
+
+        <main class="wrongbook-main">
+          <section class="wrongbook-hero">
+            <div class="wrongbook-hero-copy">
+              <p class="eyebrow"><span class="eyebrow-line"></span>WRONG BOOK · 错题本</p>
+              <h1>把错的题，<br>一道道收回来。</h1>
+              <p class="wrongbook-lead">答错自动收录，连续答对 2 次即视为掌握。换题库也不会丢，这里只记你的薄弱点。</p>
+            </div>
+            <div class="wrongbook-summary">
+              <div><strong>${stats.pending}</strong><span>待攻克</span></div>
+              <div><strong>${stats.mastered}</strong><span>已掌握</span></div>
+              <div><strong>${stats.totalWrong}</strong><span>累计错次</span></div>
+            </div>
+          </section>
+
+          <section class="wrongbook-panel">
+            <div class="wrongbook-toolbar">
+              <div class="segmented">${filters.join("")}</div>
+              <div class="wrongbook-toolbar-actions">
+                ${stats.mastered ? `<button type="button" class="text-button" data-action="clear-mastered">清空已掌握</button>` : ""}
+                <button type="button" class="button button-primary button-small" data-action="start-wrongbook-review" ${
+                  entries.length ? "" : "disabled"
+                }>${icon("play", 15)}开始攻克 ${entries.length} 题</button>
+              </div>
+            </div>
+            ${entries.length ? `<div class="wrongbook-list">${entries.map(wrongbookItem).join("")}</div>` : wrongbookEmpty(stats)}
+          </section>
+        </main>
+
+        <footer class="site-footer">
+          <span class="footer-brand">${brandMark("brand-mark-small")}小点刷题</span>
+          <span>错题只保存在本机浏览器。</span>
+          <button type="button" class="text-link" data-action="go-home">回到题库${icon("arrowRight", 14)}</button>
+        </footer>
+      </div>
+    `;
+  }
+
+  function setWrongFilter(value) {
+    if (!WRONGBOOK_FILTERS[value]) return;
+    state.wrongFilter = value;
+    if (state.route === "wrongbook") render();
+  }
+
+  function removeWrongEntry(key) {
+    const index = state.wrongbook.findIndex((entry) => entry.key === key);
+    if (index < 0) return;
+    state.wrongbook.splice(index, 1);
+    saveWrongbook(true);
+    if (state.route === "wrongbook") render();
+    toast("已从错题本移除。", "info");
+  }
+
+  function clearMasteredWrong() {
+    const mastered = state.wrongbook.filter((entry) => entry.mastered).length;
+    if (!mastered) {
+      toast("还没有已掌握的错题。", "info");
+      return;
+    }
+    state.modal = {
+      type: "confirm",
+      title: `清空 ${mastered} 道已掌握的错题？`,
+      message: "这些题目会从错题本中移除，再次答错时会重新收录。",
+      detail: "待攻克的错题不受影响。",
+      confirmLabel: "清空已掌握",
+      cancelLabel: "取消",
+      danger: true,
+      callback: () => {
+        state.wrongbook = state.wrongbook.filter((entry) => !entry.mastered);
+        saveWrongbook(true);
+        if (state.route === "wrongbook") render();
+        toast(`已清空 ${mastered} 道已掌握的错题。`, "success");
+      },
+    };
+    openModal();
+  }
+
+  /* ----------------------------------------------------------------------- */
+  /* Session resume                                                          */
+  /* ----------------------------------------------------------------------- */
+
+  function resumeSession() {
+    const session = deserializeSession(state.snapshot);
+    if (!session) {
+      clearSessionSnapshot();
+      toast("上次的进度已经失效，请重新开始一轮。", "warning");
+      render();
+      return;
+    }
+    state.snapshot = null;
+    state.session = session;
+    state.result = null;
+    state.modal = null;
+    modalRoot.innerHTML = "";
+    setBodyModal(false);
+    state.route = "session";
+    render();
+    window.scrollTo({ top: 0, behavior: "auto" });
+    if (session.mode === "exam") {
+      if (session.exam.timed && session.exam.deadline <= Date.now()) {
+        submitExam(true);
+        return;
+      }
+      startExamClock();
+    }
+    flushSessionSnapshot();
+    toast("已恢复上次的进度。", "success");
+  }
+
+  function discardSession() {
+    state.modal = {
+      type: "confirm",
+      title: "放弃上次的进度？",
+      message: "放弃后，上次未完成的那一轮学习将无法恢复。",
+      detail: "已保存的题库、练习记录和错题本不受影响。",
+      confirmLabel: "放弃进度",
+      cancelLabel: "保留",
+      danger: true,
+      callback: () => {
+        clearSessionSnapshot();
+        render();
+        toast("已放弃上次的进度。", "info");
+      },
+    };
+    openModal();
   }
 
   /* ----------------------------------------------------------------------- */
@@ -1795,6 +2884,10 @@
     const wrongEntries = isMemo ? [] : result.questions.filter((entry) => !entry.isCorrect);
     const categories = isMemo ? result.categories : uniqueCategories(result.questions.map((entry) => entry.question));
     const totalCount = result.total;
+    const categoryRows = isMemo ? [] : categoryBreakdown(result);
+    const practiceTargets = categoryRows.slice(0, 3).filter((row) => row.accuracy < 100);
+    const previous = isMemo || result.isReview ? null : previousRecord(result);
+    const accuracyDelta = previous ? result.accuracy - previous.accuracy : 0;
 
     return `
       <div class="result-shell mode-${isMemo ? "memorize" : isExam ? "exam" : "practice"}">
@@ -1812,6 +2905,21 @@
               <p class="eyebrow"><span class="eyebrow-line"></span>${isMemo ? "MEMORIZE COMPLETE" : isExam ? "EXAM COMPLETE" : "PRACTICE COMPLETE"}</p>
               <h1>${resultTitle(result)}</h1>
               <p class="result-subtitle">${escapeHtml(resultSubtitle(result))}</p>
+              ${
+                previous
+                  ? `<div class="result-compare ${accuracyDelta > 0 ? "is-up" : accuracyDelta < 0 ? "is-down" : "is-flat"}">
+                      <span class="compare-mark">${accuracyDelta > 0 ? "↑" : accuracyDelta < 0 ? "↓" : "—"}</span>
+                      <span>较上次同模式${
+                        accuracyDelta > 0
+                          ? `提升 ${accuracyDelta} 个百分点`
+                          : accuracyDelta < 0
+                          ? `下降 ${Math.abs(accuracyDelta)} 个百分点`
+                          : "持平"
+                      }</span>
+                      <small>上次正确率 ${previous.accuracy}% · ${formatDate(previous.finishedAt, true)}</small>
+                    </div>`
+                  : ""
+              }
               <div class="result-actions">
                 ${
                   wrongEntries.length
@@ -1851,6 +2959,8 @@
             }
           </section>
 
+          ${!isMemo && categoryRows.length >= 2 ? categoryAnalysisSection(categoryRows, practiceTargets) : ""}
+
           ${
             !isMemo
               ? `<section class="wrong-section">
@@ -1863,7 +2973,11 @@
                   </div>
                   ${
                     wrongEntries.length
-                      ? `<div class="wrong-list">${wrongEntries.map((entry) => wrongCard(entry, result)).join("")}</div>`
+                      ? `<div class="wrong-list">${wrongEntries.map((entry) => wrongCard(entry, result)).join("")}</div>
+                         <div class="wrongbook-link-row">
+                           <span>${icon("target", 15)}这 ${wrongEntries.length} 道题已收录到错题本，连续答对 2 次会自动标记为已掌握。</span>
+                           <button type="button" class="text-link" data-action="go-wrongbook">打开错题本${icon("arrowRight", 15)}</button>
+                         </div>`
                       : `<div class="perfect-state">
                           <span class="perfect-icon">${icon("award", 34)}</span>
                           <div><h3>漂亮，这一轮没有错题。</h3><p>可以再来一轮保持手感，或者换一个模式检验记忆。</p></div>
@@ -1875,7 +2989,7 @@
                   <div class="memo-note-icon">${icon("sparkles", 25)}</div>
                   <div>
                     <h2>背题只是第一步。</h2>
-                    <p>建议切换到做题模式，用即时反馈检验一下刚才的记忆。答错的题会自动进入成绩页，方便针对性复习。</p>
+                    <p>建议切换到做题模式，用即时反馈检验一下刚才的记忆。答错的题会自动进入错题本，方便针对性复习。</p>
                   </div>
                   <button type="button" class="button button-primary" data-action="restart-mode" data-mode="practice">转去做题${icon("arrowRight", 17)}</button>
                 </section>`
@@ -1884,6 +2998,7 @@
           <section class="result-categories">
             <span>本轮覆盖</span>
             ${categories.map((category) => `<span class="tiny-chip">${escapeHtml(category)}</span>`).join("")}
+            <button type="button" class="text-link" data-action="go-wrongbook">错题本${icon("arrowRight", 14)}</button>
           </section>
         </main>
 
@@ -1893,6 +3008,48 @@
           <button type="button" class="text-link" data-action="go-home">回到题库${icon("arrowRight", 14)}</button>
         </footer>
       </div>
+    `;
+  }
+
+  /** 成绩页分类分析：按正确率升序展示最弱 3 类，并提供专项练习入口。 */
+  function categoryAnalysisSection(rows, practiceTargets) {
+    return `
+      <section class="result-insights">
+        <div class="result-section-heading">
+          <div>
+            <p class="eyebrow">BY CATEGORY</p>
+            <h2>分类表现</h2>
+          </div>
+          <span class="result-section-count">按正确率从低到高</span>
+        </div>
+        <div class="category-analysis">
+          ${rows
+            .slice(0, 3)
+            .map(
+              (row) => `
+              <div class="category-row">
+                <div class="category-row-head">
+                  <span class="category-name">${escapeHtml(row.category)}</span>
+                  <span class="category-value">${row.correct} / ${row.total} 题 · ${row.accuracy}%</span>
+                </div>
+                <div class="category-track">
+                  <span class="category-fill ${row.accuracy >= 80 ? "is-good" : row.accuracy >= 60 ? "is-mid" : "is-low"}" style="width:${row.accuracy}%"></span>
+                </div>
+              </div>`
+            )
+            .join("")}
+        </div>
+        <div class="category-insight-foot">
+          <p>${practiceTargets.length ? "先把正确率最低的分类单独练一轮，比反复刷整套更有效。" : "本轮各分类都答对了，可以换一组题继续。"}</p>
+          ${
+            practiceTargets.length
+              ? `<button type="button" class="button button-primary" data-action="practice-weak-categories" data-categories="${escapeHtml(
+                  encodeURIComponent(JSON.stringify(practiceTargets.map((row) => row.category)))
+                )}">${icon("target", 16)}专练薄弱分类</button>`
+              : ""
+          }
+        </div>
+      </section>
     `;
   }
 
@@ -2153,6 +3310,7 @@
       questions: report.questions,
     };
     state.bank = bank;
+    state.bankStats = null;
     writeStorage(STORAGE_KEYS.bank, bank);
     state.modal = null;
     modalRoot.innerHTML = "";
@@ -2161,6 +3319,222 @@
     render();
     window.scrollTo({ top: 0, behavior: "smooth" });
     toast(`题库导入成功，共 ${bank.questions.length} 道题。`, "success");
+  }
+
+  /* ----------------------------------------------------------------------- */
+  /* Backup (export / import)                                                */
+  /* ----------------------------------------------------------------------- */
+
+  function exportBackup() {
+    const payload = {
+      app: BACKUP_APP,
+      version: BACKUP_VERSION,
+      exportedAt: Date.now(),
+      bank: state.bank,
+      records: state.records,
+      wrongbook: state.wrongbook,
+      prefs: state.prefs,
+    };
+    try {
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const date = new Date();
+      const stamp = `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}`;
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `小点刷题-备份-${stamp}.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast("备份文件已开始下载。", "success");
+    } catch (error) {
+      toast("导出失败，请检查浏览器是否允许下载文件。", "warning");
+    }
+  }
+
+  function openBackup() {
+    state.modal = { type: "backup", phase: "idle", fileName: "", error: "", summary: null, payload: null };
+    openModal();
+  }
+
+  function formatBackupTime(timestamp) {
+    const value = Number(timestamp);
+    if (!value) return "未知时间";
+    return formatDate(value, true);
+  }
+
+  /**
+   * 严格校验备份结构；任何不合法都会抛出可读错误，调用方不得修改现有数据。
+   */
+  function parseBackupPayload(text) {
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (error) {
+      throw new Error("文件不是有效的 JSON，可能已经损坏。");
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      throw new Error("备份文件内容为空或格式不正确。");
+    }
+    if (data.app && data.app !== BACKUP_APP) {
+      throw new Error("这不是「小点刷题」导出的备份文件。");
+    }
+    const bank = normalizeStoredBank(data.bank);
+    if (!bank) {
+      throw new Error("备份里没有可用的题库数据（缺少题目或结构不符）。");
+    }
+    const records = Array.isArray(data.records)
+      ? data.records
+          .filter((record) => record && ["practice", "exam"].includes(record.mode))
+          .slice(0, 30)
+      : [];
+    const wrongbook = normalizeWrongbook(data.wrongbook);
+    const prefs = normalizePrefs(data.prefs);
+    return { bank, records, wrongbook, prefs, exportedAt: Number(data.exportedAt) || 0 };
+  }
+
+  function backupModal(modal) {
+    const stats = wrongbookStats();
+    const current = `题型 ${state.bank.questions.length} 道 · 记录 ${state.records.length} 次 · 错题 ${stats.total} 道`;
+    let body = "";
+    if (modal.phase === "preview" && modal.summary) {
+      body = `
+        <div class="backup-preview">
+          <div class="backup-file-banner">
+            <span class="import-file-icon">${icon("archive", 22)}</span>
+            <div><strong>${escapeHtml(modal.fileName || "备份文件")}</strong><span>导出于 ${formatBackupTime(modal.summary.exportedAt)}</span></div>
+            <span class="import-success-mark">${icon("check", 16)}读取成功</span>
+          </div>
+          <div class="backup-summary backup-summary-grid">
+            <div><span>题库</span><strong>${escapeHtml(modal.summary.bankName)}</strong><small>${modal.summary.questionCount} 道题</small></div>
+            <div><span>练习记录</span><strong>${modal.summary.recordCount}</strong><small>条</small></div>
+            <div><span>错题本</span><strong>${modal.summary.wrongCount}</strong><small>道</small></div>
+          </div>
+          <div class="backup-warning">${icon("alert", 16)}<span>导入后会<b>覆盖</b>当前题库、练习记录、错题本与偏好设置，且无法撤销。</span></div>
+          <div class="backup-actions">
+            <button type="button" class="button button-text" data-action="backup-back">重新选择</button>
+            <button type="button" class="button button-primary button-large" data-action="confirm-backup">${icon("check", 17)}覆盖并导入</button>
+          </div>
+        </div>`;
+    } else {
+      body = `
+        ${modal.phase === "error" ? `<div class="backup-error">${icon("alert", 18)}<span>${escapeHtml(modal.error)}</span></div>` : ""}
+        <div class="backup-block">
+          <div class="backup-block-head">
+            <h3>导出当前数据</h3>
+            <span>JSON 备份</span>
+          </div>
+          <p>题库、练习记录、错题本与偏好会打包成一个 JSON 文件，可存到网盘或换设备使用。</p>
+          <div class="backup-summary">${escapeHtml(current)}</div>
+          <button type="button" class="button button-primary" data-action="export-backup">${icon("download", 17)}导出备份文件</button>
+        </div>
+        <div class="backup-divider"></div>
+        <div class="backup-block">
+          <div class="backup-block-head">
+            <h3>从备份恢复</h3>
+            <span>会覆盖当前数据</span>
+          </div>
+          <p>选择之前导出的 .json 备份文件。读取后会先展示摘要，确认后才写入。</p>
+          <input type="file" id="backupFileInput" accept=".json,application/json" hidden>
+          <button type="button" class="button button-outline" data-action="pick-backup-file">${icon("upload", 17)}选择备份文件</button>
+        </div>`;
+    }
+    return `
+      <div class="modal backup-modal" role="dialog" aria-modal="true" aria-labelledby="backup-title" tabindex="-1">
+        <div class="modal-head">
+          <div class="modal-heading">
+            <span class="modal-mode-icon mode-tone-help">${icon("archive", 24)}</span>
+            <div>
+              <p class="eyebrow">BACKUP &amp; RESTORE</p>
+              <h2 id="backup-title">数据备份</h2>
+              <span class="modal-subtitle">清空浏览器数据前，先留一份副本。</span>
+            </div>
+          </div>
+          <button type="button" class="icon-button modal-close" data-action="close-modal" aria-label="关闭备份窗口">${icon("close", 20)}</button>
+        </div>
+        <div class="modal-body">${body}</div>
+      </div>
+    `;
+  }
+
+  function pickBackupFile() {
+    const input = document.getElementById("backupFileInput");
+    if (input) input.click();
+  }
+
+  function handleBackupFile(file) {
+    if (!file || !state.modal || state.modal.type !== "backup") return;
+    state.modal.fileName = file.name || "备份文件";
+    if (!/\.json$/i.test(file.name || "")) {
+      state.modal.phase = "error";
+      state.modal.error = "目前只支持应用导出的 .json 备份文件。";
+      state.modal.payload = null;
+      renderModal();
+      return;
+    }
+    const commit = (text) => {
+      try {
+        const payload = parseBackupPayload(text);
+        state.modal.payload = payload;
+        state.modal.phase = "preview";
+        state.modal.error = "";
+        state.modal.summary = {
+          bankName: payload.bank.name,
+          questionCount: payload.bank.questions.length,
+          recordCount: payload.records.length,
+          wrongCount: payload.wrongbook.length,
+          exportedAt: payload.exportedAt,
+        };
+        renderModal();
+      } catch (error) {
+        state.modal.phase = "error";
+        state.modal.payload = null;
+        state.modal.error = error && error.message ? error.message : "无法读取这个备份文件。";
+        renderModal();
+      }
+    };
+    if (typeof file.text === "function") {
+      file
+        .text()
+        .then(commit)
+        .catch(() => {
+          state.modal.phase = "error";
+          state.modal.error = "读取文件失败，请重试或换一个备份文件。";
+          renderModal();
+        });
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => commit(String(reader.result || ""));
+    reader.onerror = () => {
+      state.modal.phase = "error";
+      state.modal.error = "读取文件失败，请重试或换一个备份文件。";
+      renderModal();
+    };
+    reader.readAsText(file);
+  }
+
+  function confirmBackupImport() {
+    if (!state.modal || state.modal.type !== "backup" || !state.modal.payload) return;
+    const payload = state.modal.payload;
+    state.bank = payload.bank;
+    state.bankStats = null;
+    state.records = payload.records;
+    state.wrongbook = payload.wrongbook;
+    state.prefs = payload.prefs;
+    writeStorage(STORAGE_KEYS.bank, state.bank);
+    saveRecords();
+    saveWrongbook(true);
+    savePrefs();
+    clearSessionSnapshot();
+    state.modal = null;
+    modalRoot.innerHTML = "";
+    setBodyModal(false);
+    state.route = "home";
+    render();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    toast(`备份已恢复：${payload.bank.questions.length} 道题、${payload.wrongbook.length} 道错题。`, "success");
   }
 
   function openHelp() {
@@ -2520,6 +3894,7 @@
     if (state.modal.type === "setup") markup = setupModal(state.modal);
     else if (state.modal.type === "import") markup = importModal(state.modal);
     else if (state.modal.type === "help") markup = helpModal();
+    else if (state.modal.type === "backup") markup = backupModal(state.modal);
     else if (state.modal.type === "confirm") markup = confirmModal(state.modal);
 
     modalRoot.innerHTML = `<div class="modal-backdrop">${markup}</div>`;
@@ -2565,6 +3940,8 @@
       if (preserveScroll) window.requestAnimationFrame(() => window.scrollTo({ top: scrollY, behavior: "auto" }));
     } else if (state.route === "result" && state.result) {
       app.innerHTML = viewResult();
+    } else if (state.route === "wrongbook") {
+      app.innerHTML = viewWrongbook();
     } else {
       app.innerHTML = viewHome();
     }
@@ -2578,12 +3955,22 @@
           window.clearInterval(examClockTimer);
           examClockTimer = null;
         }
+        if (state.session) clearSessionSnapshot();
         state.session = null;
         state.result = null;
         state.modal = null;
         modalRoot.innerHTML = "";
         setBodyModal(false);
         state.route = "home";
+        state.snapshot = loadSessionSnapshot();
+        render();
+        window.scrollTo({ top: 0, behavior: "auto" });
+        break;
+      case "go-wrongbook":
+        state.modal = null;
+        modalRoot.innerHTML = "";
+        setBodyModal(false);
+        state.route = "wrongbook";
         render();
         window.scrollTo({ top: 0, behavior: "auto" });
         break;
@@ -2682,6 +4069,61 @@
       case "download-template":
         downloadTemplate();
         break;
+      case "retry-question":
+        retryQuestion();
+        break;
+      case "set-wrong-filter":
+        setWrongFilter(target.dataset.value);
+        break;
+      case "start-wrongbook-review":
+        startWrongbookReview(target.dataset.scope === "pending");
+        break;
+      case "practice-wrong-item":
+        practiceWrongItem(target.dataset.key);
+        break;
+      case "remove-wrong":
+        removeWrongEntry(target.dataset.key);
+        break;
+      case "clear-mastered":
+        clearMasteredWrong();
+        break;
+      case "resume-session":
+        resumeSession();
+        break;
+      case "discard-session":
+        discardSession();
+        break;
+      case "export-backup":
+        exportBackup();
+        break;
+      case "open-backup":
+        openBackup();
+        break;
+      case "pick-backup-file":
+        pickBackupFile();
+        break;
+      case "backup-back":
+        if (!state.modal || state.modal.type !== "backup") return;
+        state.modal.phase = "idle";
+        state.modal.payload = null;
+        state.modal.summary = null;
+        state.modal.error = "";
+        renderModal();
+        break;
+      case "confirm-backup":
+        confirmBackupImport();
+        break;
+      case "practice-weak-categories": {
+        const raw = target.dataset.categories || "";
+        let categories = [];
+        try {
+          categories = JSON.parse(decodeURIComponent(raw));
+        } catch (error) {
+          categories = [];
+        }
+        startCategoryPractice(categories);
+        break;
+      }
       default:
         break;
     }
@@ -2718,6 +4160,10 @@
         const file = event.target.files && event.target.files[0];
         handleImportFile(file);
       }
+      if (event.target.id === "backupFileInput") {
+        const file = event.target.files && event.target.files[0];
+        handleBackupFile(file);
+      }
     });
 
     document.addEventListener("input", (event) => {
@@ -2741,9 +4187,17 @@
         return;
       }
       if (state.route !== "session" || !state.session) return;
-      const activeTag = document.activeElement && document.activeElement.tagName;
-      if (["INPUT", "TEXTAREA", "SELECT", "BUTTON", "A"].includes(activeTag)) return;
-      if (document.activeElement && document.activeElement.isContentEditable) return;
+      const active = document.activeElement;
+      const activeTag = active && active.tagName;
+      if (active && active.isContentEditable) return;
+      /* 输入框里数字键与回车保持原生行为。 */
+      if (["INPUT", "TEXTAREA", "SELECT"].includes(activeTag)) return;
+      if (activeTag === "A") return;
+      /* 选项按钮会持有焦点（局部更新后节点不再被销毁），数字键与 Enter 仍需生效；
+         其它按钮（交卷 / 上一题 / 下一题 / 标记）保留原生 Enter/Space 激活。 */
+      const optionButton =
+        activeTag === "BUTTON" && active.dataset && active.dataset.action === "select-option";
+      if (activeTag === "BUTTON" && !optionButton) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
 
       if (/^[1-9]$/.test(event.key) && state.session.mode !== "memorize") {
@@ -2755,11 +4209,12 @@
         return;
       }
       if (event.key === "Enter") {
+        /* 焦点在选项按钮上时，先阻止浏览器把 Enter 变成一次原生 click（会重复切换选项）。 */
+        event.preventDefault();
         if (state.session.mode === "practice") {
           const evaluated = state.session.evaluations[state.session.index];
           if (evaluated) nextQuestion();
           else submitPracticeAnswer();
-          event.preventDefault();
         }
         return;
       }
@@ -2797,10 +4252,24 @@
 
     window.addEventListener("beforeunload", (event) => {
       if (state.route === "session" && state.session && !state.session.finished) {
+        flushSessionSnapshot();
+        flushWrongbook();
         event.preventDefault();
         event.returnValue = "";
       }
     });
+
+    /* 手机端被系统回收时不会触发 beforeunload，退到后台即保存；回到前台立即校准倒计时。 */
+    const flushPendingWrites = () => {
+      flushSessionSnapshot();
+      flushWrongbook();
+    };
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") flushPendingWrites();
+      else refreshExamClock();
+    });
+    window.addEventListener("focus", refreshExamClock);
+    window.addEventListener("pagehide", flushPendingWrites);
   }
 
   init();

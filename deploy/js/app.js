@@ -6,6 +6,7 @@
     records: "xiaodian.records.v1",
     wrongbook: "xiaodian.wrongbook.v1",
     prefs: "xiaodian.prefs.v1",
+    progress: "xiaodian.progress.v1",
   };
 
   /* 进行中的会话放在 sessionStorage：关闭标签页即失效，但刷新/被系统回收后可恢复。 */
@@ -14,6 +15,10 @@
   const SESSION_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
   const BACKUP_APP = "xiaodian";
   const BACKUP_VERSION = 1;
+
+  /* 按题库记录的做题进度：localStorage 持久保存，按题库指纹隔离，最多保留 8 个题库。 */
+  const PROGRESS_VERSION = 1;
+  const MAX_PROGRESS_ENTRIES = 8;
 
   const WRONGBOOK_FILTERS = {
     all: { label: "全部" },
@@ -253,6 +258,7 @@
     records: [],
     wrongbook: [],
     prefs: {},
+    progress: { version: PROGRESS_VERSION, entries: {} },
     route: "home",
     modal: null,
     session: null,
@@ -265,6 +271,7 @@
 
   let examClockTimer = null;
   let sessionSaveTimer = null;
+  let progressSaveTimer = null;
   let wrongbookSaveTimer = null;
   let lastFocusedElement = null;
 
@@ -304,6 +311,16 @@
     } catch (error) {
       state.storageOk = false;
       toast("浏览器未能保存数据，导入的题库可能在刷新后丢失。", "warning");
+      return false;
+    }
+  }
+
+  /** 静默写入：进度记录属于「有更好、没有也能用」的数据，写失败时不打扰用户。 */
+  function writeStorageQuiet(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+      return true;
+    } catch (error) {
       return false;
     }
   }
@@ -538,6 +555,7 @@
       bankName: session.bankName || "",
       isReview: Boolean(session.isReview),
       configLabel: session.configLabel || "",
+      setupSign: session.setupSign || null,
       focusCategories: Array.isArray(session.focusCategories) ? session.focusCategories : null,
       wrongRecorded: Array.isArray(session.wrongRecorded) ? session.wrongRecorded : [],
       exam: session.exam
@@ -609,6 +627,8 @@
         exam,
         bankName: String(snapshot.bankName || ""),
         configLabel: String(snapshot.configLabel || (snapshot.isReview ? "错题重练" : "全部分类")),
+        /* 旧快照没有 setupSign：降级为 null，不提升版本号，避免丢弃用户已有的会话。 */
+        setupSign: normalizeSetupSign(snapshot.setupSign),
         focusCategories: Array.isArray(snapshot.focusCategories)
           ? snapshot.focusCategories.filter((item) => typeof item === "string")
           : null,
@@ -630,6 +650,7 @@
   }
 
   function scheduleSessionSave() {
+    scheduleProgressSave();
     if (sessionSaveTimer) return;
     sessionSaveTimer = window.setTimeout(() => {
       sessionSaveTimer = null;
@@ -643,6 +664,7 @@
       sessionSaveTimer = null;
     }
     writeSessionSnapshot();
+    flushProgress();
   }
 
   function clearSessionSnapshot() {
@@ -664,6 +686,266 @@
   }
 
   /* ----------------------------------------------------------------------- */
+  /* Per-bank progress (localStorage)                                        */
+  /* ----------------------------------------------------------------------- */
+
+  /** FNV-1a 32 位哈希：把任意长度的题目指纹压成 8 位十六进制。 */
+  function fnv1a(text) {
+    const source = String(text == null ? "" : text);
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < source.length; i += 1) {
+      hash ^= source.charCodeAt(i);
+      /* 乘以 FNV 素数 16777619，用移位相加避免大整数精度问题。 */
+      hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+    }
+    return hash.toString(16).padStart(8, "0");
+  }
+
+  /** 稳定的题目短 id：与 questionKey 同源，只存 8 个字符，避免 localStorage 膨胀。 */
+  function questionKeyHash(question) {
+    const key = questionKey(question);
+    return key ? fnv1a(key) : "";
+  }
+
+  /** 题库内容指纹：题库名 + 题数 + 所有题目指纹，换题库即换 key。 */
+  function bankFingerprint(bank) {
+    const questions = Array.isArray(bank.questions) ? bank.questions : [];
+    const digest = fnv1a(`${String(bank.name || "")}\u0000${questions.length}\u0000${questions.map(questionKey).join("\u0001")}`);
+    return `${digest}-${questions.length}`;
+  }
+
+  /** 设置签名：范围 + 数量 + 顺序，用于判断进度记录是否与当前设置匹配。 */
+  function normalizeSetupSign(value) {
+    if (!value || typeof value !== "object") return null;
+    if (typeof value.scope !== "string" || typeof value.count !== "string" || typeof value.order !== "string") return null;
+    return { scope: value.scope, count: value.count, order: value.order };
+  }
+
+  /** 校验单条进度记录，任何字段不合规都返回 null（静默丢弃）。 */
+  function normalizeProgressRecord(value) {
+    if (!value || typeof value !== "object") return null;
+    const bankKey = typeof value.bankKey === "string" ? value.bankKey : "";
+    if (!bankKey) return null;
+    const rawKeys = Array.isArray(value.keys) ? value.keys : [];
+    if (!rawKeys.length) return null;
+    const seen = new Set();
+    const keys = [];
+    for (let i = 0; i < rawKeys.length; i += 1) {
+      const id = rawKeys[i];
+      if (typeof id !== "string" || !id || seen.has(id)) return null;
+      seen.add(id);
+      keys.push(id);
+    }
+    const total = keys.length;
+    const rawSelections = Array.isArray(value.selections) ? value.selections : [];
+    const selections = Array.from({ length: total }, (_, index) => {
+      const raw = rawSelections[index];
+      if (!Array.isArray(raw)) return [];
+      return raw.filter((key) => typeof key === "string").sort();
+    });
+    const rawEvaluations = Array.isArray(value.evaluations) ? value.evaluations : [];
+    const evaluations = Array.from({ length: total }, (_, index) => {
+      const raw = rawEvaluations[index];
+      if (!raw || typeof raw !== "object") return null;
+      return {
+        selected: Array.isArray(raw.selected) ? raw.selected.filter((key) => typeof key === "string") : [],
+        isCorrect: Boolean(raw.isCorrect),
+        missing: Array.isArray(raw.missing) ? raw.missing.filter((key) => typeof key === "string") : undefined,
+        extra: Array.isArray(raw.extra) ? raw.extra.filter((key) => typeof key === "string") : undefined,
+      };
+    });
+    const index = Math.min(total - 1, Math.max(0, Math.round(Number(value.index) || 0)));
+    const savedAt = Number(value.savedAt);
+    /* 没有保存时间的记录无从比较新旧，也展示不出「何时保存」，直接丢弃。 */
+    if (!Number.isFinite(savedAt) || savedAt <= 0) return null;
+    return {
+      bankKey,
+      bankName: String(value.bankName || ""),
+      mode: "practice",
+      scope: typeof value.scope === "string" ? value.scope : "all",
+      count: String(value.count == null ? "all" : value.count),
+      order: value.order === "random" ? "random" : "sequential",
+      index,
+      keys,
+      selections,
+      evaluations,
+      configLabel: typeof value.configLabel === "string" ? value.configLabel : "",
+      savedAt,
+    };
+  }
+
+  /** 只保留最近的 MAX_PROGRESS_ENTRIES 个题库，按保存时间淘汰最旧的。 */
+  function trimProgressEntries(entries) {
+    const keys = Object.keys(entries);
+    if (keys.length <= MAX_PROGRESS_ENTRIES) return entries;
+    keys.sort((a, b) => (Number(entries[a].savedAt) || 0) - (Number(entries[b].savedAt) || 0));
+    const trimmed = {};
+    keys.slice(keys.length - MAX_PROGRESS_ENTRIES).forEach((key) => {
+      trimmed[key] = entries[key];
+    });
+    return trimmed;
+  }
+
+  function normalizeProgress(value) {
+    const entries = {};
+    const source = value && typeof value === "object" && value.entries && typeof value.entries === "object" ? value.entries : null;
+    if (!source) return { version: PROGRESS_VERSION, entries };
+    Object.keys(source).forEach((key) => {
+      const record = normalizeProgressRecord(source[key]);
+      if (record && record.bankKey === key) entries[key] = record;
+    });
+    return { version: PROGRESS_VERSION, entries: trimProgressEntries(entries) };
+  }
+
+  function loadProgress() {
+    return normalizeProgress(readStorage(STORAGE_KEYS.progress));
+  }
+
+  function progressBankKey() {
+    return bankStats().fingerprint || "";
+  }
+
+  /** 只有「从设置弹窗开始、非错题重练」的做题会话才有「按题库记忆」的语义。 */
+  function canRememberProgress(session) {
+    if (!session || session.finished || !session.setupSign) return false;
+    if (state.route !== "session") return false;
+    return session.mode === "practice" && !session.isReview;
+  }
+
+  function buildProgressRecord(session, bankKey) {
+    return {
+      bankKey,
+      bankName: session.bankName || state.bank.name,
+      mode: "practice",
+      scope: session.setupSign.scope,
+      count: String(session.setupSign.count),
+      order: session.setupSign.order,
+      index: session.index,
+      keys: session.questions.map(questionKeyHash),
+      selections: session.selections.map((selection) => (Array.isArray(selection) ? [...selection].sort() : [])),
+      evaluations: session.evaluations.map((evaluation) =>
+        evaluation
+          ? {
+              selected: Array.isArray(evaluation.selected) ? [...evaluation.selected] : [],
+              isCorrect: Boolean(evaluation.isCorrect),
+              missing: Array.isArray(evaluation.missing) ? [...evaluation.missing] : undefined,
+              extra: Array.isArray(evaluation.extra) ? [...evaluation.extra] : undefined,
+            }
+          : null
+      ),
+      configLabel: session.configLabel || "",
+      savedAt: Date.now(),
+    };
+  }
+
+  /**
+   * 会话是否「实质还没开始」：停在第 1 题、一道未选、也没有任何判题结果。
+   * 这种状态不写进度，避免用户点开就退出后首页多出一张「第 1 题 · 已答 0 题」的空卡片。
+   * 通过答题卡跳到后面的题（index > 0）即使没作答，也算已经开始。
+   */
+  function isSessionUntouched(session) {
+    if (!session || session.index !== 0) return false;
+    if (session.selections.some((selection) => Array.isArray(selection) && selection.length)) return false;
+    if (session.evaluations.some(Boolean)) return false;
+    return true;
+  }
+
+  /** 写入当前题库的进度。失败即放弃本次持久化，不弹提示。 */
+  function saveProgressNow() {
+    const session = state.session;
+    if (!canRememberProgress(session)) return false;
+    if (isSessionUntouched(session)) return false;
+    const bankKey = progressBankKey();
+    if (!bankKey) return false;
+    const entries = { ...state.progress.entries };
+    entries[bankKey] = buildProgressRecord(session, bankKey);
+    state.progress = { version: PROGRESS_VERSION, entries: trimProgressEntries(entries) };
+    return writeStorageQuiet(STORAGE_KEYS.progress, state.progress);
+  }
+
+  function scheduleProgressSave() {
+    if (progressSaveTimer) return;
+    progressSaveTimer = window.setTimeout(() => {
+      progressSaveTimer = null;
+      saveProgressNow();
+    }, 300);
+  }
+
+  function flushProgress() {
+    if (progressSaveTimer) {
+      window.clearTimeout(progressSaveTimer);
+      progressSaveTimer = null;
+    }
+    saveProgressNow();
+  }
+
+  /** 完成或放弃一轮后清掉该题库的进度，下次从第 1 题开始。 */
+  function removeProgressRecord() {
+    if (progressSaveTimer) {
+      window.clearTimeout(progressSaveTimer);
+      progressSaveTimer = null;
+    }
+    const bankKey = progressBankKey();
+    if (!bankKey || !state.progress.entries[bankKey]) return;
+    const entries = { ...state.progress.entries };
+    delete entries[bankKey];
+    state.progress = { version: PROGRESS_VERSION, entries };
+    writeStorageQuiet(STORAGE_KEYS.progress, state.progress);
+  }
+
+  /** 当前题库的进度记录（已通过结构校验）。 */
+  function bankProgressRecord() {
+    const bankKey = progressBankKey();
+    if (!bankKey) return null;
+    return state.progress.entries[bankKey] || null;
+  }
+
+  function progressAnsweredCount(record) {
+    if (!record || !Array.isArray(record.selections)) return 0;
+    return record.selections.filter((selection) => Array.isArray(selection) && selection.length).length;
+  }
+
+  /**
+   * 把进度记录还原成题目数组。缺任何一题、或出现哈希碰撞时返回 null 放弃恢复。
+   * 题库里重复录入的同一道题（指纹相同）不算碰撞，取第一次出现的那道即可。
+   */
+  function resolveProgressQuestions(record) {
+    if (!record || !Array.isArray(record.keys) || !record.keys.length) return null;
+    const byId = new Map();
+    const questions = state.bank.questions;
+    for (let i = 0; i < questions.length; i += 1) {
+      const key = questionKey(questions[i]);
+      const id = key ? fnv1a(key) : "";
+      if (!id) continue;
+      const existing = byId.get(id);
+      if (!existing) {
+        byId.set(id, { key, question: questions[i] });
+      } else if (existing.key !== key) {
+        /* 同一短 id 对应两道不同的题：哈希碰撞，放弃恢复。 */
+        return null;
+      }
+    }
+    const resolved = [];
+    for (let i = 0; i < record.keys.length; i += 1) {
+      const entry = byId.get(record.keys[i]);
+      if (!entry) return null;
+      resolved.push(entry.question);
+    }
+    return resolved;
+  }
+
+  /** 与当前设置弹窗匹配的进度记录（范围 / 数量 / 顺序完全一致才算）。 */
+  function matchingProgressRecord(modal) {
+    if (!modal || modal.mode !== "practice") return null;
+    const record = bankProgressRecord();
+    if (!record) return null;
+    if (record.scope !== modal.category) return null;
+    if (String(record.count) !== String(modal.count)) return null;
+    if (record.order !== modal.order) return null;
+    return record;
+  }
+
+  /* ----------------------------------------------------------------------- */
   /* Derived helpers                                                         */
   /* ----------------------------------------------------------------------- */
 
@@ -676,6 +958,7 @@
       counts: countByType(questions),
       categories: uniqueCategories(questions),
       totalPoints: totalScore(questions),
+      fingerprint: bankFingerprint(state.bank),
     };
     state.bankStats = stats;
     return stats;
@@ -902,6 +1185,7 @@
     state.records = loadRecords();
     state.wrongbook = loadWrongbook();
     state.prefs = normalizePrefs(readStorage(STORAGE_KEYS.prefs));
+    state.progress = loadProgress();
     state.snapshot = loadSessionSnapshot();
     bindEvents();
     render();
@@ -932,6 +1216,12 @@
     const recentRecords = state.records.slice(0, 3);
     const sourceFile = state.bank.sourceFile || "本机题库.xlsx";
     const storageLabel = state.storageOk ? "已保存在本机" : "仅本次有效";
+    /* 有「按题库记忆」的进度时，首屏主按钮直接给出「继续第 N 题」，
+       否则进度卡在首屏以下，用户要滚很久才知道能接着练。 */
+    const bankRecord = state.snapshot ? null : bankProgressRecord();
+    const heroStartLabel = bankRecord
+      ? `继续第 ${Math.min(bankRecord.keys.length - 1, Math.max(0, Number(bankRecord.index) || 0)) + 1} 题`
+      : "开始做题";
 
     return `
       <div class="site-shell">
@@ -963,7 +1253,7 @@
               <p class="hero-description">导入自己的 Excel 题库，在做题、背题与模拟考试之间自由切换。少一点焦虑，多一点确定的进步。</p>
               <div class="hero-actions">
                 <button type="button" class="button button-primary button-large" data-action="open-setup" data-mode="practice">
-                  ${icon("play", 18)}开始做题
+                  ${icon("play", 18)}${heroStartLabel}
                 </button>
                 <button type="button" class="button button-text button-large" data-action="open-help">
                   查看使用说明${icon("arrowRight", 18)}
@@ -1110,11 +1400,17 @@
     if (!total) return "";
     const index = Math.min(total - 1, Math.max(0, Number(snapshot.index) || 0));
     const isExam = snapshot.mode === "exam";
+    const isMemo = snapshot.mode === "memorize";
     const selections = Array.isArray(snapshot.selections) ? snapshot.selections : [];
-    const answered = isExam
-      ? selections.filter((selection) => Array.isArray(selection) && selection.length).length
-      : index + 1;
+    const answeredCount = selections.filter((selection) => Array.isArray(selection) && selection.length).length;
+    /* 进度条口径沿用原语义：考试看已答比例，做题/背题看翻到第几题。 */
+    const answered = isExam ? answeredCount : index + 1;
     const progress = total ? Math.round((answered / total) * 100) : 0;
+    const subtitle = isExam
+      ? `已答 ${answeredCount} / ${total} 题`
+      : isMemo
+      ? `进度 ${index + 1} / ${total} 题 · 已浏览 ${index + 1} 题`
+      : `进度 ${index + 1} / ${total} 题 · 已答 ${answeredCount} 题`;
     let timerText = "";
     if (isExam && snapshot.exam && snapshot.exam.timed) {
       const remaining = Math.max(0, (Number(snapshot.exam.deadline) - Date.now()) / 1000);
@@ -1126,9 +1422,7 @@
         <div class="resume-copy">
           <p class="eyebrow">RESUME · 继续上次</p>
           <h3>${escapeHtml(snapshot.isReview ? "错题重练" : meta.label)}还没做完</h3>
-          <p>${isExam ? `已答 ${answered} / ${total} 题` : `进度 ${index + 1} / ${total} 题`}${
-            timerText ? ` · ${timerText}` : ""
-          } · ${formatDate(snapshot.savedAt, true)}保存</p>
+          <p>${subtitle}${timerText ? ` · ${timerText}` : ""} · ${formatDate(snapshot.savedAt, true)}保存</p>
           <div class="resume-track"><span style="width:${progress}%"></span></div>
         </div>
         <div class="resume-actions">
@@ -1139,14 +1433,38 @@
     `;
   }
 
+  /** 按题库记忆的进度卡：没有 sessionStorage 快照时才出现，避免两张卡片重复。 */
+  function bankProgressCard(record) {
+    const total = record.keys.length;
+    const index = Math.min(total - 1, Math.max(0, Number(record.index) || 0));
+    const answered = progressAnsweredCount(record);
+    const progress = total ? Math.round(((index + 1) / total) * 100) : 0;
+    return `
+      <article class="resume-card resume-card-bank">
+        <span class="resume-icon">${icon("pen", 22)}</span>
+        <div class="resume-copy">
+          <p class="eyebrow">PROGRESS · 按题库记忆</p>
+          <h3>${escapeHtml(record.bankName || state.bank.name)} · 这一轮还没做完</h3>
+          <p>第 ${index + 1} / ${total} 题 · 已答 ${answered} 题 · ${formatDate(record.savedAt, true)}保存</p>
+          <div class="resume-track"><span style="width:${progress}%"></span></div>
+        </div>
+        <div class="resume-actions">
+          <button type="button" class="button button-primary" data-action="resume-bank-progress">${icon("play", 16)}继续练习</button>
+          <button type="button" class="button button-text" data-action="discard-bank-progress">放弃</button>
+        </div>
+      </article>
+    `;
+  }
+
   function homePulseSection() {
     const stats = wrongbookStats();
     const snapshot = state.snapshot;
+    const progress = snapshot ? null : bankProgressRecord();
     const streak = studyStreakDays();
     const totalRounds = state.records.length;
     return `
       <section class="home-pulse" aria-label="学习状态与数据">
-        ${snapshot ? resumeCardMarkup(snapshot) : ""}
+        ${snapshot ? resumeCardMarkup(snapshot) : progress ? bankProgressCard(progress) : ""}
         <div class="pulse-grid">
           <article class="pulse-card pulse-card-wrong">
             <div class="pulse-head">
@@ -1276,17 +1594,30 @@
       return;
     }
     const categories = uniqueCategories(state.bank.questions);
-    const initialCategory = "all";
+    /* 做题模式沿用上次进度记录里的范围与题量：否则默认「全部分类」会让签名对不上，
+       既显示不出恢复提示，也无法自动恢复。考试 / 背题保持原有默认值。 */
+    const record = mode === "practice" ? bankProgressRecord() : null;
+    const initialCategory = record && record.scope !== "all" && categories.includes(record.scope) ? record.scope : "all";
     const totalInScope = scopedQuestions(initialCategory).length;
+    let initialCount = defaultCount(mode, totalInScope);
+    if (record) {
+      const saved = String(record.count);
+      const savedNumber = Number(saved);
+      /* 题库变小后不能留一个不存在的题量（例如只剩 12 题时的「50 题」）。 */
+      const usable = saved === "all" || (Number.isInteger(savedNumber) && savedNumber > 0 && savedNumber <= totalInScope);
+      if (usable) initialCount = saved;
+    }
     state.modal = {
       type: "setup",
       mode,
       category: initialCategory,
-      count: defaultCount(mode, totalInScope),
+      count: initialCount,
       order: state.prefs.setupOrder === "random" ? "random" : "sequential",
       timed: true,
       minutes: state.prefs.examMinutes || 30,
       categories,
+      /* 做题设置里默认沿用「按题库记忆」的进度，用户可切换为从头开始。 */
+      restore: true,
     };
     openModal();
   }
@@ -1307,7 +1638,25 @@
     const allPoints = totalScore(selectedQuestions);
     const categories = modal.categories;
     const isExam = modal.mode === "exam";
-    const startLabel = isExam ? "开始考试" : modal.mode === "memorize" ? "开始背题" : "开始做题";
+    const restoreRecord = modal.mode === "practice" ? matchingProgressRecord(modal) : null;
+    const restoreActive = Boolean(restoreRecord) && modal.restore !== false;
+    const restoreIndex = restoreRecord
+      ? Math.min(restoreRecord.keys.length - 1, Math.max(0, Number(restoreRecord.index) || 0))
+      : 0;
+    const startLabel = restoreActive
+      ? `继续第 ${restoreIndex + 1} 题`
+      : isExam
+      ? "开始考试"
+      : modal.mode === "memorize"
+      ? "开始背题"
+      : "开始做题";
+    const summaryTip = isExam
+      ? modal.timed
+        ? "开始后计时，时间到自动交卷"
+        : "不限时，按自己的节奏完成"
+      : restoreActive
+      ? `将从第 ${restoreIndex + 1} 题继续，之前的作答已保留`
+      : "答案与解析都来自题库内容";
 
     return `
       <div class="modal setup-modal" role="dialog" aria-modal="true" aria-labelledby="setup-title" tabindex="-1">
@@ -1322,6 +1671,7 @@
           <button type="button" class="icon-button modal-close" data-action="close-modal" aria-label="关闭设置">${icon("close", 20)}</button>
         </div>
         <div class="modal-body">
+          ${restoreRecord ? setupRestoreNotice(modal, restoreRecord) : ""}
           ${isExam ? examSetupBody(modal, selectedQuestions) : regularSetupBody(modal, allQuestions, categories)}
           <div class="setup-summary">
             <div>
@@ -1334,7 +1684,7 @@
               <strong>${modal.category === "all" ? "全部分类" : escapeHtml(modal.category)}</strong>
             </div>
             ${isExam ? `<div class="summary-divider"></div><div><span>满分</span><strong>${allPoints} 分</strong></div>` : ""}
-            <span class="summary-tip">${icon("info", 15)}${isExam ? (modal.timed ? "开始后计时，时间到自动交卷" : "不限时，按自己的节奏完成") : "答案与解析都来自题库内容"}</span>
+            <span class="summary-tip">${icon("info", 15)}${escapeHtml(summaryTip)}</span>
           </div>
         </div>
         <div class="modal-footer">
@@ -1343,6 +1693,26 @@
             ${startLabel}${icon("arrowRight", 18)}
           </button>
         </div>
+      </div>
+    `;
+  }
+
+  /** 设置弹窗里的「继续上次进度」提示块：展示上次位置，并允许切回从头开始。 */
+  function setupRestoreNotice(modal, record) {
+    const total = record.keys.length;
+    const index = Math.min(total - 1, Math.max(0, Number(record.index) || 0));
+    const answered = progressAnsweredCount(record);
+    const active = modal.restore !== false;
+    return `
+      <div class="setup-restore ${active ? "is-on" : ""}">
+        <span class="setup-restore-icon">${icon("rotate", 18)}</span>
+        <div class="setup-restore-copy">
+          <strong>上次练到第 ${index + 1} / ${total} 题</strong>
+          <span>已答 ${answered} 题 · ${formatDate(record.savedAt, true)}保存</span>
+        </div>
+        <button type="button" class="button button-outline button-small setup-restore-toggle" data-action="toggle-setup-restore" aria-pressed="${active}">
+          ${active ? "从头开始" : "继续上次"}
+        </button>
       </div>
     `;
   }
@@ -1442,6 +1812,37 @@
   }
 
   /**
+   * 把进度记录裁剪成与当前题目数量对应的会话状态。
+   * 返回 null 表示这条记录不可用于恢复（例如数量不一致）。
+   */
+  function restoreProgressState(record, total) {
+    if (!record || !total) return null;
+    if (!Array.isArray(record.keys) || record.keys.length !== total) return null;
+    const selections = Array.from({ length: total }, (_, index) => {
+      const raw = Array.isArray(record.selections) ? record.selections[index] : null;
+      return Array.isArray(raw) ? [...raw].sort() : [];
+    });
+    const evaluations = Array.from({ length: total }, (_, index) => {
+      const raw = Array.isArray(record.evaluations) ? record.evaluations[index] : null;
+      if (!raw || typeof raw !== "object") return null;
+      const evaluation = {
+        selected: Array.isArray(raw.selected) ? [...raw.selected] : [],
+        isCorrect: Boolean(raw.isCorrect),
+      };
+      if (Array.isArray(raw.missing)) evaluation.missing = [...raw.missing];
+      if (Array.isArray(raw.extra)) evaluation.extra = [...raw.extra];
+      return evaluation;
+    });
+    /* 已判错的题在恢复后不再重复计入错题本。 */
+    const wrongRecorded = [];
+    evaluations.forEach((evaluation, index) => {
+      if (evaluation && !evaluation.isCorrect) wrongRecorded.push(index);
+    });
+    const index = Math.min(total - 1, Math.max(0, Math.round(Number(record.index) || 0)));
+    return { index, selections, evaluations, wrongRecorded };
+  }
+
+  /**
    * 统一开启一轮会话。练习/背题/考试、错题重练、错题本、薄弱分类都走这里，
    * 避免每个入口各写一份 state.session 初始化逻辑。
    */
@@ -1459,12 +1860,14 @@
     const now = Date.now();
     const timed = mode === "exam" ? Boolean(config.timed) : false;
     const minutes = timed ? Math.max(1, Math.round(Number(config.minutes) || 30)) : 0;
+    const setupSign = normalizeSetupSign(config.setupSign);
+    const restored = setupSign ? restoreProgressState(config.restore, questions.length) : null;
     state.session = {
       mode,
       questions,
-      index: 0,
-      selections: questions.map(() => []),
-      evaluations: questions.map(() => null),
+      index: restored ? restored.index : 0,
+      selections: restored ? restored.selections : questions.map(() => []),
+      evaluations: restored ? restored.evaluations : questions.map(() => null),
       flags: questions.map(() => false),
       startedAt: now,
       finished: false,
@@ -1480,8 +1883,9 @@
           : null,
       bankName: state.bank.name,
       configLabel: config.configLabel || (mode === "exam" ? "完整试卷" : "全部分类"),
+      setupSign,
       focusCategories: Array.isArray(config.focusCategories) ? config.focusCategories : null,
-      wrongRecorded: [],
+      wrongRecorded: restored ? restored.wrongRecorded : [],
     };
     state.result = null;
     state.modal = null;
@@ -1513,24 +1917,46 @@
       }
       minutes = Math.round(minutes);
     }
-    const questions = setupQuestions(setup);
+    let questions = setupQuestions(setup);
     if (!questions.length) {
       toast("当前范围没有题目，请更换范围。", "warning");
       return;
+    }
+    /* 设置匹配且有可用的进度记录时，用记录里的题目顺序接着上次继续。 */
+    let restore = null;
+    if (setup.mode === "practice" && setup.restore !== false) {
+      const record = matchingProgressRecord(setup);
+      if (record) {
+        const resolved = resolveProgressQuestions(record);
+        if (resolved && resolved.length) {
+          questions = resolved;
+          restore = record;
+        }
+      }
+    }
+    /* 用户明确选「从头开始」：清掉同一签名下的旧记录，
+       避免这一轮一题未答就退出时旧进度又冒出来。签名不匹配的记录属于别的设置组合，不动。 */
+    if (setup.mode === "practice" && setup.restore === false && matchingProgressRecord(setup)) {
+      removeProgressRecord();
     }
     state.prefs = {
       setupOrder: setup.order === "random" ? "random" : "sequential",
       examMinutes: setup.mode === "exam" && setup.timed ? minutes : state.prefs.examMinutes || 30,
     };
     savePrefs();
-    beginSession({
+    const started = beginSession({
       mode: setup.mode,
       questions,
       isReview: false,
       timed: Boolean(setup.timed),
       minutes,
       configLabel: setup.category === "all" ? "全部分类" : setup.category,
+      setupSign: { scope: setup.category, count: String(setup.count), order: setup.order },
+      restore,
     });
+    if (started && restore) {
+      toast(`已恢复到上次进度：第 ${state.session.index + 1} / ${questions.length} 题`, "success");
+    }
   }
 
   /* ----------------------------------------------------------------------- */
@@ -1627,7 +2053,7 @@
           </div>
         </header>
 
-        ${isExam ? mobileExamPalette(session) : ""}
+        ${mobilePalette(session)}
 
         <main class="session-main">
           <section class="question-card ${isMemo ? "question-card-memo" : ""}" aria-labelledby="question-stem">
@@ -1984,27 +2410,150 @@
     `;
   }
 
-  function mobileExamPalette(session) {
+  /** 答题卡计数文案：三种模式各自的统计口径。 */
+  function mobilePaletteCountText(session) {
+    const total = session.questions.length;
+    if (session.mode === "memorize") return `${session.index + 1} / ${total} 已浏览`;
+    if (session.mode === "exam") {
+      const answered = session.selections.filter((selection) => selection.length).length;
+      return `已答 ${answered} / ${total}`;
+    }
+    const done = session.evaluations.filter(Boolean).length;
+    return `已答 ${done} / ${total}`;
+  }
+
+  /** 单个答题卡圆点：做题看对错、背题看是否已浏览、考试看已答与标记。 */
+  function mobilePaletteDot(session, index) {
+    const classes = ["exam-map-dot"];
+    let label = "";
+    if (session.mode === "exam") {
+      const answered = Boolean(session.selections[index] && session.selections[index].length);
+      const flagged = Boolean(session.flags[index]);
+      if (answered) classes.push("is-answered");
+      if (index === session.index) classes.push("is-current");
+      if (flagged) classes.push("is-flagged");
+      label = `第 ${index + 1} 题${answered ? "，已作答" : "，未作答"}${flagged ? "，已标记" : ""}`;
+    } else if (session.mode === "memorize") {
+      classes.push(index === session.index ? "is-current" : "is-visited");
+      label = `跳到第 ${index + 1} 题`;
+    } else {
+      const evaluation = session.evaluations[index];
+      if (evaluation) classes.push(evaluation.isCorrect ? "is-correct" : "is-wrong");
+      if (index === session.index) classes.push("is-current");
+      label = `第 ${index + 1} 题${evaluation ? (evaluation.isCorrect ? "，答对" : "，答错") : "，未作答"}`;
+    }
+    return `<button type="button" class="${classes.join(" ")}" data-action="jump-question" data-index="${index}" aria-label="${label}">${index + 1}</button>`;
+  }
+
+  function mobilePaletteLegend(session) {
+    if (session.mode === "exam") {
+      return `
+        <div class="mobile-palette-legend">
+          <span><i class="legend-dot legend-current"></i>当前</span>
+          <span><i class="legend-dot legend-answered"></i>已答</span>
+          <span><i class="legend-dot legend-empty"></i>未答</span>
+          <span><i class="legend-flag">${icon("flag", 11)}</i>标记</span>
+        </div>`;
+    }
+    if (session.mode === "memorize") {
+      return `
+        <div class="mobile-palette-legend">
+          <span><i class="legend-dot legend-current"></i>当前</span>
+          <span><i class="legend-dot legend-visited"></i>已浏览</span>
+        </div>`;
+    }
     return `
-      <div class="mobile-exam-palette">
-        <div class="mobile-palette-head"><span>答题卡</span><span id="mobilePaletteCount">已答 ${session.selections.filter((selection) => selection.length).length} / ${session.questions.length}</span></div>
-        <div class="mobile-palette-scroll">
-          ${session.questions
-            .map((_, index) => {
-              const classes = [
-                "exam-map-dot",
-                session.selections[index].length ? "is-answered" : "",
-                index === session.index ? "is-current" : "",
-                session.flags[index] ? "is-flagged" : "",
-              ]
-                .filter(Boolean)
-                .join(" ");
-              return `<button type="button" class="${classes}" data-action="jump-question" data-index="${index}" aria-label="跳到第 ${index + 1} 题">${index + 1}</button>`;
-            })
-            .join("")}
+      <div class="mobile-palette-legend">
+        <span><i class="legend-dot legend-current"></i>当前</span>
+        <span><i class="legend-dot legend-correct"></i>答对</span>
+        <span><i class="legend-dot legend-wrong"></i>答错</span>
+        <span><i class="legend-dot legend-empty"></i>未答</span>
+      </div>`;
+  }
+
+  /**
+   * 移动端答题卡：做题 / 背题 / 考试共用，默认横向滚动，可展开成网格。
+   * 外层的 mobile-exam-palette 是既有响应式样式的挂载点，不要改名。
+   */
+  function mobilePalette(session) {
+    const modeClass = session.isReview ? "review" : session.mode;
+    return `
+      <div class="mobile-exam-palette mobile-palette mode-${modeClass}">
+        <div class="mobile-palette-head">
+          <span class="mobile-palette-title">${icon("grid", 14)}答题卡</span>
+          <span class="mobile-palette-meta">
+            <span id="mobilePaletteCount">${mobilePaletteCountText(session)}</span>
+            <button type="button" class="mobile-palette-toggle" data-action="toggle-mobile-palette" aria-expanded="false" aria-controls="mobilePaletteScroll">
+              ${icon("grid", 12)}<b>展开</b>
+            </button>
+          </span>
         </div>
+        <div class="mobile-palette-scroll" id="mobilePaletteScroll">
+          ${session.questions.map((_, index) => mobilePaletteDot(session, index)).join("")}
+        </div>
+        ${mobilePaletteLegend(session)}
       </div>
     `;
+  }
+
+  /** 展开 / 收起答题卡：只切 DOM class，不重渲染会话。 */
+  function toggleMobilePalette() {
+    const palette = document.querySelector(".mobile-palette");
+    if (!palette) return;
+    const expanded = !palette.classList.contains("is-expanded");
+    palette.classList.toggle("is-expanded", expanded);
+    const button = palette.querySelector('[data-action="toggle-mobile-palette"]');
+    if (button) {
+      button.setAttribute("aria-expanded", expanded ? "true" : "false");
+      const label = button.querySelector("b");
+      if (label) label.textContent = expanded ? "收起" : "展开";
+    }
+    /* 收起后滚动位置会归零、展开后变成纵向滚动，两种状态都要重新对齐当前题。 */
+    scrollPaletteToCurrent();
+  }
+
+  /**
+   * 把当前题圆点滚到可视区中部，避免整页跳动：
+   * 收起态是横向滚动（scrollLeft），展开态是网格 + 纵向滚动（scrollTop）。
+   */
+  function scrollPaletteToCurrent() {
+    const palette = document.querySelector(".mobile-palette");
+    const scroller = document.querySelector(".mobile-palette-scroll");
+    if (!scroller) return;
+    const current = scroller.querySelector(".exam-map-dot.is-current");
+    if (!current) return;
+    const expanded = Boolean(palette && palette.classList.contains("is-expanded"));
+    const box = scroller.getBoundingClientRect();
+    const dot = current.getBoundingClientRect();
+
+    if (expanded) {
+      if (scroller.scrollHeight <= scroller.clientHeight + 2) {
+        scroller.scrollTop = 0;
+        return;
+      }
+      const delta = dot.top + dot.height / 2 - (box.top + box.height / 2);
+      const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      const next = Math.max(0, Math.min(max, scroller.scrollTop + delta));
+      if (typeof scroller.scrollTo === "function") {
+        scroller.scrollTo({ top: next, behavior: "smooth" });
+      } else {
+        scroller.scrollTop = next;
+      }
+      return;
+    }
+
+    if (scroller.scrollWidth <= scroller.clientWidth + 2) {
+      scroller.scrollLeft = 0;
+      return;
+    }
+    const delta = dot.left + dot.width / 2 - (box.left + box.width / 2);
+    const max = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
+    const next = Math.max(0, Math.min(max, scroller.scrollLeft + delta));
+    if (typeof scroller.scrollTo === "function") {
+      scroller.scrollTo({ left: next, behavior: "smooth" });
+    } else {
+      scroller.scrollLeft = next;
+    }
   }
 
   /* ----------------------------------------------------------------------- */
@@ -2046,11 +2595,13 @@
       setText("asideCorrect", correct);
       setText("asideWrong", done - correct);
       setRing(total ? Math.round((done / total) * 100) : 0);
+      setText("mobilePaletteCount", `已答 ${done} / ${total}`);
       return;
     }
     if (session.mode === "memorize") {
       setText("asideCompleted", `${session.index + 1} / ${total}`);
       setRing(total ? Math.round(((session.index + 1) / total) * 100) : 0);
+      setText("mobilePaletteCount", `${session.index + 1} / ${total} 已浏览`);
       return;
     }
     const answered = session.selections.filter((selection) => selection.length).length;
@@ -2104,17 +2655,32 @@
     }
   }
 
+  /** 做题模式的圆点：桌面侧栏只读圆点 + 移动端答题卡，同一份状态两处同步。 */
   function updatePracticeDots(session, indices) {
-    const dots = document.querySelectorAll(".mini-map .mini-map-dot");
-    if (!dots.length) return;
     const targets = indices || session.questions.map((_, index) => index);
+    const miniDots = document.querySelectorAll(".mini-map .mini-map-dot");
     targets.forEach((index) => {
-      const dot = dots[index];
-      if (!dot) return;
       const evaluation = session.evaluations[index];
-      dot.classList.toggle("is-correct", Boolean(evaluation && evaluation.isCorrect));
-      dot.classList.toggle("is-wrong", Boolean(evaluation && !evaluation.isCorrect));
-      dot.classList.toggle("is-current", index === session.index);
+      const isCorrect = Boolean(evaluation && evaluation.isCorrect);
+      const isWrong = Boolean(evaluation && !evaluation.isCorrect);
+      const isCurrent = index === session.index;
+      const dot = miniDots[index];
+      if (dot) {
+        dot.classList.toggle("is-correct", isCorrect);
+        dot.classList.toggle("is-wrong", isWrong);
+        dot.classList.toggle("is-current", isCurrent);
+      }
+      const mobileDots = document.querySelectorAll(`.mobile-palette .exam-map-dot[data-index="${index}"]`);
+      for (let i = 0; i < mobileDots.length; i += 1) {
+        const node = mobileDots[i];
+        node.classList.toggle("is-correct", isCorrect);
+        node.classList.toggle("is-wrong", isWrong);
+        node.classList.toggle("is-current", isCurrent);
+        node.setAttribute(
+          "aria-label",
+          `第 ${index + 1} 题${evaluation ? (isCorrect ? "，答对" : "，答错") : "，未作答"}`
+        );
+      }
     });
   }
 
@@ -2137,11 +2703,18 @@
     });
   }
 
+  /** 背题模式：桌面可点击列表 + 移动端答题卡同步「当前 / 已浏览」。 */
   function updateMemoDots(session) {
     const dots = document.querySelectorAll(".mini-map.is-clickable .mini-map-dot");
     for (let i = 0; i < dots.length; i += 1) {
       dots[i].classList.toggle("is-current", i === session.index);
       dots[i].classList.toggle("is-visited", i !== session.index);
+    }
+    const mobileDots = document.querySelectorAll(".mobile-palette .exam-map-dot[data-index]");
+    for (let i = 0; i < mobileDots.length; i += 1) {
+      const index = Number(mobileDots[i].dataset.index);
+      mobileDots[i].classList.toggle("is-current", index === session.index);
+      mobileDots[i].classList.toggle("is-visited", index !== session.index);
     }
   }
 
@@ -2163,6 +2736,7 @@
     if (session.mode === "exam") updateExamDots(session, [previousIndex, session.index]);
     if (session.mode === "practice") updatePracticeDots(session, [previousIndex, session.index]);
     if (session.mode === "memorize") updateMemoDots(session);
+    scrollPaletteToCurrent();
     scheduleSessionSave();
   }
 
@@ -2345,11 +2919,15 @@
   }
 
   function finishWithResult(result) {
+    const finishedSession = state.session;
     if (examClockTimer) {
       window.clearInterval(examClockTimer);
       examClockTimer = null;
     }
     if (state.session) state.session.finished = true;
+    /* 整轮完成即清除该题库的进度记录，下次从第 1 题开始。
+       只有做题模式会写进度，考试/背题结束时不要误删做题进度。 */
+    if (finishedSession && finishedSession.setupSign && finishedSession.mode === "practice") removeProgressRecord();
     if (result.mode !== "memorize" && !result.isReview) {
       state.records.unshift({
         id: `record-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -2512,6 +3090,11 @@
     if (!state.session) return;
     const session = state.session;
     const exam = session.mode === "exam";
+    /* 带 setupSign 的做题会话会把进度按题库存进 localStorage，退出不清空。 */
+    const keepsProgress = Boolean(session.setupSign) && session.mode === "practice" && !session.isReview;
+    /* 还没开始作答的会话本来就不会写进度，文案也就不要承诺「进度已保留」。 */
+    const untouched = keepsProgress && isSessionUntouched(session);
+    const savedProgress = keepsProgress && !untouched;
     state.modal = {
       type: "confirm",
       title: exam ? "确定退出考试？" : "结束本轮学习？",
@@ -2519,12 +3102,20 @@
         ? "考试进行中。退出后本场考试不会计分，已作答的内容也会清空。"
         : session.mode === "memorize"
         ? "退出后将回到首页，本轮背题进度不会保留。"
-        : "本轮答题进度将不会保留，确定返回首页吗？",
-      detail: "离开页面前系统会自动保存进度，回来可以接着做；主动退出则会清空本轮。",
+        : savedProgress
+        ? `退出后本轮进度会保留，下次进入同一题库可从第 ${session.index + 1} 题继续。`
+        : untouched
+        ? "本轮还没有开始作答，退出后不会留下进度记录。"
+        : "错题重练的进度不会保留，主动退出会清空本次作答。",
+      detail: savedProgress
+        ? "进度按题库保存，换题库不会互相影响；完成整轮后会自动清除。"
+        : "离开页面前系统会自动保存进度，回来可以接着做；主动退出则会清空本轮。",
       confirmLabel: exam ? "退出考试" : "退出本轮",
       cancelLabel: "继续学习",
       danger: true,
       callback: () => {
+        /* 先落盘再销毁会话，保证「退出后仍能继续」。 */
+        if (savedProgress) flushProgress();
         if (examClockTimer) {
           window.clearInterval(examClockTimer);
           examClockTimer = null;
@@ -2537,7 +3128,7 @@
         setBodyModal(false);
         render();
         window.scrollTo({ top: 0, behavior: "auto" });
-        toast("已退出本轮学习。", "info");
+        toast(savedProgress ? "已退出本轮学习，进度已按题库保存。" : "已退出本轮学习。", "info");
       },
     };
     openModal();
@@ -2801,6 +3392,55 @@
         clearSessionSnapshot();
         render();
         toast("已放弃上次的进度。", "info");
+      },
+    };
+    openModal();
+  }
+
+  /** 首页「继续上次练习」：从 localStorage 的按题库进度恢复。 */
+  function resumeBankProgress() {
+    const record = bankProgressRecord();
+    if (!record) {
+      render();
+      return;
+    }
+    const questions = resolveProgressQuestions(record);
+    if (!questions || !questions.length) {
+      removeProgressRecord();
+      toast("上次的练习进度已失效，请重新开始一轮。", "warning");
+      render();
+      return;
+    }
+    const started = beginSession({
+      mode: "practice",
+      questions,
+      isReview: false,
+      configLabel: record.configLabel || (record.scope === "all" ? "全部分类" : record.scope),
+      setupSign: { scope: record.scope, count: String(record.count), order: record.order },
+      restore: record,
+    });
+    if (started) {
+      toast(`已恢复到上次进度：第 ${state.session.index + 1} / ${questions.length} 题`, "success");
+    }
+  }
+
+  function discardBankProgress() {
+    const record = bankProgressRecord();
+    if (!record) return;
+    const total = record.keys.length;
+    const index = Math.min(total - 1, Math.max(0, Number(record.index) || 0));
+    state.modal = {
+      type: "confirm",
+      title: "放弃这个题库的练习进度？",
+      message: `第 ${index + 1} / ${total} 题的位置和已答内容会被清除，下次从第 1 题开始。`,
+      detail: "已保存的题库、练习记录和错题本不受影响。",
+      confirmLabel: "放弃进度",
+      cancelLabel: "保留",
+      danger: true,
+      callback: () => {
+        removeProgressRecord();
+        render();
+        toast("已放弃上次的练习进度。", "info");
       },
     };
     openModal();
@@ -4092,6 +4732,20 @@
         break;
       case "discard-session":
         discardSession();
+        break;
+      case "toggle-mobile-palette":
+        toggleMobilePalette();
+        break;
+      case "toggle-setup-restore":
+        if (!state.modal || state.modal.type !== "setup") return;
+        state.modal.restore = state.modal.restore === false;
+        renderModal('[data-action="toggle-setup-restore"]');
+        break;
+      case "resume-bank-progress":
+        resumeBankProgress();
+        break;
+      case "discard-bank-progress":
+        discardBankProgress();
         break;
       case "export-backup":
         exportBackup();

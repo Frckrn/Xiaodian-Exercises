@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------------
+# 小点刷题 · Git 忽略规则
+# 注意：deploy/ 与「小点刷题-部署包.zip」是刻意纳入版本管理的发布产物，
+#       assets/question-bank-template.xlsx 是题库模板，三者都不要忽略。
+# ---------------------------------------------------------------------------
+
+# 操作系统
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Python 缓存（build_template.py、build_deploy.py 运行后产生）
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Node 依赖与包管理器日志（本项目无构建依赖，防止误装后提交）
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# 本地临时文件、日志与缓存
+*.log
+*.tmp
+*.bak
+*.swp
+.cache/
+
+# WorkBuddy 会话数据与项目记忆：含本机路径与个人笔记，不随仓库分发
+.workbuddy/
+
+# 应用内导出的个人数据备份（含题库与错题内容，避免误提交）
+小点刷题-备份-*.json

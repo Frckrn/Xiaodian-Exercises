@@ -6784,3 +6784,253 @@ body.modal-open .deck-glow {
     min-height: 40px;
   }
 }
+
+/* --------------------------------------------------------------------------
+   移动端答题卡（做题 / 背题 / 考试共用）与按题库记忆进度
+   -------------------------------------------------------------------------- */
+
+/* 答题卡圆点状态：做题看对错、背题看是否已浏览；考试沿用 is-answered / is-flagged */
+.exam-map-dot.is-correct {
+  color: var(--green);
+  background: var(--green-soft);
+}
+
+.exam-map-dot.is-wrong {
+  color: var(--red);
+  background: var(--red-soft);
+}
+
+.exam-map-dot.is-visited {
+  color: var(--muted);
+  background: #f2ede4;
+}
+
+.exam-map-dot.is-correct.is-current,
+.exam-map-dot.is-wrong.is-current,
+.exam-map-dot.is-visited.is-current {
+  border-color: var(--study-color);
+  box-shadow: 0 0 0 2px var(--study-color) inset;
+}
+
+.mobile-palette .mobile-palette-head {
+  gap: 8px;
+}
+
+.mobile-palette-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink-soft);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.mobile-palette-title .icon {
+  color: var(--muted-light);
+}
+
+.mobile-palette-meta {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mobile-palette-meta #mobilePaletteCount {
+  font-family: var(--font-number);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.mobile-palette-toggle {
+  min-height: 24px;
+  padding: 3px 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 99px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  background: var(--surface);
+  font-family: var(--font-sans);
+  font-size: 9px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 150ms ease, border-color 150ms ease, background-color 150ms ease;
+}
+
+.mobile-palette-toggle:hover {
+  color: var(--brand);
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
+.mobile-palette-toggle:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.mobile-palette-toggle b {
+  font-weight: 600;
+}
+
+/* 图例默认收起，展开后才显示 */
+.mobile-palette-legend {
+  display: none;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin-top: 9px;
+  color: var(--muted-light);
+  font-size: 8.5px;
+}
+
+.mobile-palette-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.mobile-palette-legend .legend-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+}
+
+.mobile-palette-legend .legend-correct {
+  border: 1px solid var(--green);
+  background: var(--green-soft);
+}
+
+.mobile-palette-legend .legend-wrong {
+  border: 1px solid var(--red);
+  background: var(--red-soft);
+}
+
+.mobile-palette-legend .legend-visited {
+  border: 1px solid var(--line-strong);
+  background: #f2ede4;
+}
+
+/* 展开：圆点换行成网格，容器可纵向滚动 */
+.mobile-palette.is-expanded .mobile-palette-scroll {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(34px, 1fr));
+  gap: 6px;
+  max-height: 44vh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 2px 2px 6px;
+  scrollbar-width: thin;
+}
+
+.mobile-palette.is-expanded .mobile-palette-scroll .exam-map-dot {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1 / 1;
+  flex: 0 0 auto;
+}
+
+.mobile-palette.is-expanded .mobile-palette-legend {
+  display: flex;
+}
+
+/* 设置弹窗里的「继续上次进度」提示块 */
+.setup-restore {
+  margin: 3px 0 14px;
+  padding: 13px 15px;
+  border: 1px solid rgba(31, 74, 59, 0.16);
+  border-radius: 14px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--surface-soft);
+}
+
+.setup-restore.is-on {
+  border-color: rgba(31, 74, 59, 0.28);
+  background: var(--brand-soft);
+}
+
+.setup-restore-icon {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  color: var(--brand);
+  background: rgba(255, 253, 248, 0.72);
+}
+
+.setup-restore-copy {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.setup-restore-copy strong {
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.setup-restore-copy span {
+  color: var(--muted);
+  font-size: 9.5px;
+  line-height: 1.5;
+}
+
+.setup-restore-toggle {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* 首页「继续上次练习」卡片：与 sessionStorage 恢复卡区分一下图标底色 */
+.resume-card-bank .resume-icon {
+  color: var(--teal-deep);
+  background: var(--teal-soft);
+}
+
+@media (max-width: 640px) {
+  .mobile-palette-meta {
+    gap: 6px;
+  }
+
+  .mobile-palette.is-expanded .mobile-palette-scroll {
+    grid-template-columns: repeat(auto-fill, minmax(30px, 1fr));
+    gap: 5px;
+  }
+
+  .mobile-palette.is-expanded .mobile-palette-scroll .exam-map-dot {
+    font-size: 9.5px;
+  }
+
+  .setup-restore {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .setup-restore-toggle {
+    margin-left: auto;
+  }
+}
+
+@media (max-width: 380px) {
+  .mobile-palette-title {
+    font-size: 8.5px;
+  }
+
+  .mobile-palette.is-expanded .mobile-palette-scroll {
+    grid-template-columns: repeat(auto-fill, minmax(28px, 1fr));
+  }
+}
+
+/* 弹窗打开时把 toast 抬到弹窗底部按钮区之上（仅窄屏）：避免压住主按钮 */
+@media (max-width: 640px) {
+  body.modal-open .toast-root {
+    bottom: 92px;
+  }
+}
